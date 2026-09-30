@@ -182,25 +182,82 @@ hardware_interface::return_type DiffBotSystemHardware::read(
     status.name = "diffbot_mcu_status";
     status.hardware_id = cfg_.device;
 
-    const bool estop_active = comms_.front_estop_active() || comms_.back_estop_active();
-    const bool stopped = estop_active || comms_.bumper_latched();
+    // Collect every active problem instead of picking only the single
+    // highest-priority one, so the web HMI's "AMR Status" box can show more
+    // than one simultaneous issue (2026-10-01) - e.g. an E-stop AND a CAN
+    // fault at once - and so front/back E-stop are distinguishable instead
+    // of both collapsing into one generic "E-STOP ACTIVE" string.
+    std::vector<std::string> errors;
+    std::vector<std::string> warnings;
 
-    if (stopped)
+    if (comms_.front_estop_active() && comms_.back_estop_active())
+    {
+      errors.push_back("Front + Back E-Stop Active");
+    }
+    else if (comms_.front_estop_active())
+    {
+      errors.push_back("Front E-Stop Active");
+    }
+    else if (comms_.back_estop_active())
+    {
+      errors.push_back("Back E-Stop Active");
+    }
+    if (comms_.bumper_latched())
+    {
+      errors.push_back("Bumper Latched - press and release an E-stop to clear");
+    }
+    if (comms_.can_fault())
+    {
+      warnings.push_back("CAN Bus Fault");
+    }
+    if (comms_.comms_timeout())
+    {
+      warnings.push_back("Comms Heartbeat Timeout");
+    }
+    if (comms_.drive_fault_code() != 0x00)
+    {
+      // 0x00 = no fault; the drive's actual fault-code meanings aren't
+      // otherwise documented here.
+      std::ostringstream fault_msg;
+      fault_msg << "Drive Fault: 0x" << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(comms_.drive_fault_code());
+      warnings.push_back(fault_msg.str());
+    }
+
+    if (!errors.empty())
     {
       status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-      status.message = comms_.bumper_latched() && !estop_active
-        ? "BUMPER LATCHED - press and release an E-stop to clear"
-        : "E-STOP ACTIVE";
     }
-    else if (comms_.can_fault() || comms_.comms_timeout())
+    else if (!warnings.empty())
     {
       status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      status.message = comms_.can_fault() ? "CAN bus fault" : "Comms heartbeat timeout";
     }
     else
     {
       status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    }
+
+    if (errors.empty() && warnings.empty())
+    {
       status.message = "OK";
+    }
+    else
+    {
+      std::ostringstream joined;
+      bool first = true;
+      for (const auto & issue : errors)
+      {
+        if (!first) { joined << "\n"; }
+        joined << issue;
+        first = false;
+      }
+      for (const auto & issue : warnings)
+      {
+        if (!first) { joined << "\n"; }
+        joined << issue;
+        first = false;
+      }
+      status.message = joined.str();
     }
 
     auto kv = [](const std::string & key, const std::string & value)

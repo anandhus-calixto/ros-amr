@@ -51,7 +51,7 @@ install(TARGETS calixto_hardware
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY config description launch worlds maps rviz gazebo
+install(DIRECTORY config description launch worlds maps rviz gazebo web_hmi
   DESTINATION share/${PROJECT_NAME}
 )
 

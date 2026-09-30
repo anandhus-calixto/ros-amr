@@ -1,0 +1,25 @@
+cmd_vel_mux:
+  ros__parameters:
+    # Consumed by web_hmi/cmd_vel_mux.py - NOT the real twist_mux package (see
+    # that file's docstring for why: twist_mux/rosbridge_suite/novnc all need
+    # `sudo apt install` and there is no interactive sudo available here).
+    # Kept as its own file (config/twist_mux.yaml is untouched) since that one
+    # is still what nav2_sim.launch.py expects if the real twist_mux package
+    # is ever installed for Gazebo sim testing.
+    output_topic: /cmd_vel
+    mode_topic: /hmi/cmd_vel_mode
+    active_source_topic: /hmi/cmd_vel_active_source
+    rate: 20.0
+    topics:
+      remote:
+        topic: /cmd_vel_remote
+        timeout: 0.5
+        priority: 150
+      teleop:
+        topic: /cmd_vel_teleop
+        timeout: 0.5
+        priority: 100
+      nav:
+        topic: /cmd_vel_nav
+        timeout: 0.5
+        priority: 10

@@ -9,6 +9,8 @@
 #include <sstream>
 #include <vector>
 
+#include "diagnostic_msgs/msg/diagnostic_status.hpp"
+#include "diagnostic_msgs/msg/key_value.hpp"
 #include "hardware_interface/lexical_casts.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -111,6 +113,15 @@ hardware_interface::CallbackReturn DiffBotSystemHardware::on_activate(
 {
   RCLCPP_INFO(get_logger(), "Activating ...please wait...");
   comms_.connect(cfg_.device, cfg_.baud_rate, cfg_.timeout_ms);
+
+  // MCU status publisher (2026-09-30) - a bare node just for this one
+  // publisher; no executor/spin needed since it never subscribes to
+  // anything, only ever calls publish(). See mcu_comms.hpp's status_flags()
+  // family for what feeds this.
+  diagnostics_node_ = std::make_shared<rclcpp::Node>("diffbot_mcu_diagnostics");
+  diagnostics_pub_ = diagnostics_node_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    "/mcu_status", rclcpp::QoS(10));
+
   RCLCPP_INFO(get_logger(), "Successfully activated!");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -120,6 +131,8 @@ hardware_interface::CallbackReturn DiffBotSystemHardware::on_deactivate(
 {
   RCLCPP_INFO(get_logger(), "Deactivating ...please wait...");
   comms_.disconnect();
+  diagnostics_pub_.reset();
+  diagnostics_node_.reset();
   RCLCPP_INFO(get_logger(), "Successfully deactivated!");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -158,6 +171,60 @@ hardware_interface::return_type DiffBotSystemHardware::read(
   double dt = period.seconds();
   wheel_left_.vel = (wheel_left_.pos - prev_left) / dt;
   wheel_right_.vel = (wheel_right_.pos - prev_right) / dt;
+
+  // MCU status (E-stop/bumper/CAN fault) - 2026-09-30. Published every
+  // successful telemetry read, so anything subscribed (a web HMI, rqt,
+  // ros2 topic echo) sees it at the same ~20 Hz rate as encoder ticks -
+  // no separate polling of the MCU needed elsewhere.
+  if (diagnostics_pub_ && comms_.status_valid())
+  {
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "diffbot_mcu_status";
+    status.hardware_id = cfg_.device;
+
+    const bool estop_active = comms_.front_estop_active() || comms_.back_estop_active();
+    const bool stopped = estop_active || comms_.bumper_latched();
+
+    if (stopped)
+    {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      status.message = comms_.bumper_latched() && !estop_active
+        ? "BUMPER LATCHED - press and release an E-stop to clear"
+        : "E-STOP ACTIVE";
+    }
+    else if (comms_.can_fault() || comms_.comms_timeout())
+    {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+      status.message = comms_.can_fault() ? "CAN bus fault" : "Comms heartbeat timeout";
+    }
+    else
+    {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+      status.message = "OK";
+    }
+
+    auto kv = [](const std::string & key, const std::string & value)
+    {
+      diagnostic_msgs::msg::KeyValue pair;
+      pair.key = key;
+      pair.value = value;
+      return pair;
+    };
+    status.values.push_back(kv("front_estop", comms_.front_estop_active() ? "ACTIVE" : "ok"));
+    status.values.push_back(kv("back_estop", comms_.back_estop_active() ? "ACTIVE" : "ok"));
+    status.values.push_back(kv("bumper", comms_.bumper_active() ? "TRIPPED" : "ok"));
+    status.values.push_back(kv("bumper_latched", comms_.bumper_latched() ? "true" : "false"));
+    status.values.push_back(kv("can_fault", comms_.can_fault() ? "true" : "false"));
+    std::ostringstream fault_code_str;
+    fault_code_str << "0x" << std::hex << std::setw(2) << std::setfill('0')
+                   << static_cast<int>(comms_.drive_fault_code());
+    status.values.push_back(kv("drive_fault_code", fault_code_str.str()));
+
+    diagnostic_msgs::msg::DiagnosticArray msg;
+    msg.header.stamp = diagnostics_node_->now();
+    msg.status.push_back(status);
+    diagnostics_pub_->publish(msg);
+  }
 
   return hardware_interface::return_type::OK;
 }

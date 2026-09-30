@@ -42,6 +42,15 @@ constexpr uint8_t SYNC_TELEMETRY         = 0x5A;  // i.MX RT -> i.MX 95
 
 constexpr uint8_t CMD_ID_DRIVE_VELOCITY = 0x01;
 
+// status_flags bits (Telemetry Packet, Byte 19) - must match
+// mcu_frame_protocol.h's MCU_STATUS_* exactly.
+constexpr uint8_t STATUS_FRONT_ESTOP    = 1u << 0;
+constexpr uint8_t STATUS_BACK_ESTOP     = 1u << 1;
+constexpr uint8_t STATUS_BUMPER         = 1u << 2;  // raw switch level right now
+constexpr uint8_t STATUS_COMMS_TIMEOUT  = 1u << 3;
+constexpr uint8_t STATUS_CAN_FAULT      = 1u << 4;
+constexpr uint8_t STATUS_BUMPER_LATCHED = 1u << 5;  // the actual stop condition - see safety.c
+
 #pragma pack(push, 1)
 
 struct TelemetryRequestPacket
@@ -196,8 +205,27 @@ public:
 
     left = pkt.encoder_ticks_left;
     right = pkt.encoder_ticks_right;
+    status_flags_ = pkt.status_flags;
+    drive_fault_code_ = pkt.drive_fault_code;
+    status_valid_ = true;
     return true;
   }
+
+  // Status from the most recent successfully-parsed Telemetry Packet - see
+  // calixto_mcu_protocol::STATUS_* above for the bit meanings. status_valid()
+  // is false until the first successful read_encoder_values() call, and
+  // stays true afterwards (holds the last-known value through a later
+  // failed read, same as encoder ticks aren't reset on failure either).
+  bool status_valid() const { return status_valid_; }
+  uint8_t status_flags() const { return status_flags_; }
+  uint8_t drive_fault_code() const { return drive_fault_code_; }
+
+  bool front_estop_active() const { return status_flags_ & calixto_mcu_protocol::STATUS_FRONT_ESTOP; }
+  bool back_estop_active() const { return status_flags_ & calixto_mcu_protocol::STATUS_BACK_ESTOP; }
+  bool bumper_active() const { return status_flags_ & calixto_mcu_protocol::STATUS_BUMPER; }
+  bool bumper_latched() const { return status_flags_ & calixto_mcu_protocol::STATUS_BUMPER_LATCHED; }
+  bool comms_timeout() const { return status_flags_ & calixto_mcu_protocol::STATUS_COMMS_TIMEOUT; }
+  bool can_fault() const { return status_flags_ & calixto_mcu_protocol::STATUS_CAN_FAULT; }
 
   // Fire-and-forget - firmware sends no reply to a Command Packet.
   void set_motor_values(double left, double right)
@@ -223,4 +251,7 @@ private:
     LibSerial::SerialPort serial_conn_;
     int timeout_ms_ = 0;
     uint16_t sequence_num_ = 0;
+    uint8_t status_flags_ = 0;
+    uint8_t drive_fault_code_ = 0;
+    bool status_valid_ = false;
 };

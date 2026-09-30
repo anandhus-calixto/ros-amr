@@ -899,13 +899,16 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status.json":
             with _status_lock:
-                self._send_json(dict(_latest_status))
+                data = dict(_latest_status)
+            self._send_json(data)
         elif self.path == "/active.json":
             with _active_lock:
-                self._send_json(dict(_latest_active))
+                data = dict(_latest_active)
+            self._send_json(data)
         elif self.path == "/pose.json":
             with _pose_lock:
-                self._send_json(dict(_latest_pose))
+                data = dict(_latest_pose)
+            self._send_json(data)
         elif self.path in ("/", "/index.html"):
             body = HTML_PAGE.encode("utf-8")
             self.send_response(200)

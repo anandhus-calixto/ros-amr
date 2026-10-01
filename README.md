@@ -152,6 +152,27 @@ own header comment for what's installed and why, and the device/permission
 note there (currently `--privileged` for development simplicity - revisit
 once cameras/LIDAR are actually connected).
 
+**Starting the full real-hardware stack after a board/container reboot:**
+
+Neither the container's own restart (`--restart=always`) nor a board reboot
+brings the actual ROS2 nodes back up on their own yet (see
+`PENDING_ISSUES.md` - a real supervised auto-start is deliberately deferred
+until this is out of active bring-up). Until then, start everything by hand
+with one script:
+
+```bash
+ssh <board>
+docker exec -it ros2_humble bash /ros2_ws/src/ros-amr/docker/run_full_stack.sh
+```
+
+This starts, in order: the `bno055` IMU driver, the `ros2_control`+EKF
+control stack (talking to the real i.MX RT1176 MCU - pass a different
+device as the one argument if `/dev/ttymxc2` ever changes), the real
+`twist_mux`, the `scripts/twist_stamper.py` relay it needs (see that file's
+own comment - a plain-Twist-to-TwistStamped type mismatch otherwise
+silently blocks all teleop), and the web HMI on port 8080. Logs land in
+`/tmp/*_stack.log` inside the container if anything needs checking.
+
 **WiFi dongle (TP-Link AC600 / RTL8811AU) not surviving a reboot:**
 
 If `lsmod | grep 8821au` comes back empty after a board reset (no

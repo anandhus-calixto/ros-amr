@@ -173,6 +173,41 @@ own comment - a plain-Twist-to-TwistStamped type mismatch otherwise
 silently blocks all teleop), and the web HMI on port 8080. Logs land in
 `/tmp/*_stack.log` inside the container if anything needs checking.
 
+**Resource usage baseline (i.MX8M Plus, 2026-10-01)** - measured via
+`/proc/stat` deltas on the host (4x Cortex-A53), idle vs. the full stack
+above actually running:
+
+| | cpu0 | cpu1 | cpu2 | cpu3 |
+|---|---|---|---|---|
+| Idle | ~7% | ~5% | ~6% | ~8% |
+| Full stack running | ~25% | ~21% | ~13% | ~15% |
+
+Roughly 3x idle, ~18-20% average per core - moderate load, no core close to
+saturated. Biggest single consumer: the `bno055` driver itself (~39% of one
+core), from its 100Hz I2C polling (`data_query_frequency` in its params) -
+the first thing to tune down if CPU ever gets tight. RAM: 3.5GB total, only
+~535MB used at this baseline (board is the 4GB variant) - plenty of
+headroom. USB: the WiFi dongle sits on its own USB2 bus; two USB3 (5Gbps)
+controllers are completely free for a depth camera, with no bandwidth
+contention against WiFi.
+
+**Headroom for LiDAR/depth camera (assessment, not yet tested on real
+sensors):** the raw sensor drivers themselves are lightweight relative to
+this headroom. The real cost is what runs on top - a 2D LiDAR +
+`slam_toolbox` + Nav2 should comfortably fit (that combo routinely runs on
+Raspberry Pi 4-class hardware, comparable to or weaker than this board). A
+3D LiDAR's point cloud volume is a bigger step up - fine for voxel-filtered
+obstacle avoidance, could get tight for dense 3D SLAM run alongside
+everything else. For a depth camera, local use (feeding Nav2's costmap) is
+a moderate addition; *streaming* the raw feed live over WiFi competes with
+the same link already carrying robot control traffic - prefer
+`compressed_image_transport` (JPEG/H264) over raw if live viewing is
+wanted. None of this is benchmarked against real hardware yet - re-run the
+same check (`python3 scripts/percore_cpu.py` on the board host, outside
+the container - samples `/proc/stat` over a 2s window) after adding each
+sensor to catch a real problem immediately rather than guessing ahead of
+time.
+
 **WiFi dongle (TP-Link AC600 / RTL8811AU) not surviving a reboot:**
 
 If `lsmod | grep 8821au` comes back empty after a board reset (no

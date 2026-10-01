@@ -1,8 +1,10 @@
 #include <libserial/SerialPort.h>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 // Binary MCU<->MPU packet protocol (standardized 2026-09-29). Same wire
 // format as calixto-amr-imx-rt-app/src/mcu_frame/mcu_frame_protocol.h on the
@@ -150,6 +152,20 @@ public:
   // bad sync byte, or a CRC mismatch, left/right are set to 0 (same
   // effective behaviour as the old ASCII path's atoi("") on an empty/timed
   // out response) and false is returned.
+  //
+  // Fixed 2026-10-01: this used to do a single blind
+  // Read(in, sizeof(TelemetryPacket), timeout) - i.e. "read exactly the
+  // next 24 bytes and hope byte 0 is the sync byte" - with no scanning or
+  // resync. That's fine for a one-off manual test, but under
+  // ros2_control's continuous ~20Hz polling, write()'s own Command Packets
+  // going out on the same wire could leave a few stray bytes ahead of a
+  // reply; once that shifted this blind read by even one byte, EVERY
+  // subsequent cycle stayed misaligned too (confirmed on hardware:
+  // continuous "bad sync byte" failures, with only the rare lucky
+  // realignment slipping a valid packet through). Now scans byte-by-byte
+  // for the real sync byte first and discards anything else - the same
+  // resync strategy the firmware's own lpuart6.c already uses correctly on
+  // its side - bounded by the same overall timeout_ms_ budget.
   bool read_encoder_values(int &left, int &right)
   {
     using namespace calixto_mcu_protocol;
@@ -162,37 +178,77 @@ public:
                                reinterpret_cast<const uint8_t *>(&req) + sizeof(req));
     serial_conn_.Write(out);
 
-    LibSerial::DataBuffer in;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+    bool found_sync = false;
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+      if (remaining_ms <= 0)
+      {
+        break;
+      }
+
+      LibSerial::DataBuffer one;
+      try
+      {
+        serial_conn_.Read(one, 1, static_cast<size_t>(remaining_ms));
+      }
+      catch (const LibSerial::ReadTimeout&)
+      {
+        break;
+      }
+
+      if (one.size() == 1 && one[0] == SYNC_TELEMETRY)
+      {
+        found_sync = true;
+        break;
+      }
+      // Anything else (a stray Command-Packet byte, noise, etc.) is
+      // discarded and scanning continues - same as the firmware's resync.
+    }
+
+    if (!found_sync)
+    {
+      std::cerr << "Telemetry read timed out waiting for sync byte." << std::endl;
+      left = 0;
+      right = 0;
+      return false;
+    }
+
+    auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now()).count();
+
+    LibSerial::DataBuffer rest;
     try
     {
-      serial_conn_.Read(in, sizeof(TelemetryPacket), timeout_ms_);
+      serial_conn_.Read(rest, sizeof(TelemetryPacket) - 1,
+                         static_cast<size_t>(remaining_ms > 0 ? remaining_ms : 1));
     }
     catch (const LibSerial::ReadTimeout&)
     {
-      std::cerr << "Telemetry read timed out." << std::endl;
+      std::cerr << "Telemetry read timed out after sync byte." << std::endl;
       left = 0;
       right = 0;
       return false;
     }
 
-    if (in.size() != sizeof(TelemetryPacket))
+    if (rest.size() != sizeof(TelemetryPacket) - 1)
     {
-      std::cerr << "Telemetry packet wrong size: " << in.size() << std::endl;
+      std::cerr << "Telemetry packet wrong size: " << (rest.size() + 1) << std::endl;
       left = 0;
       right = 0;
       return false;
     }
+
+    std::vector<uint8_t> full;
+    full.reserve(sizeof(TelemetryPacket));
+    full.push_back(SYNC_TELEMETRY);
+    full.insert(full.end(), rest.begin(), rest.end());
 
     TelemetryPacket pkt;
-    std::memcpy(&pkt, in.data(), sizeof(pkt));
-
-    if (pkt.header != SYNC_TELEMETRY)
-    {
-      std::cerr << "Telemetry packet bad sync byte: 0x" << std::hex << (int)pkt.header << std::dec << std::endl;
-      left = 0;
-      right = 0;
-      return false;
-    }
+    std::memcpy(&pkt, full.data(), sizeof(pkt));
 
     uint8_t calc_crc = crc8(reinterpret_cast<const uint8_t *>(&pkt), offsetof(TelemetryPacket, crc8));
     if (calc_crc != pkt.crc8)

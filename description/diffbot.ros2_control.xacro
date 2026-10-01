@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="diffbot_ros2_control" params="name prefix use_mock_hardware use_gz_sim:=^|false serial_port:=/dev/ttyLP2">
+
+    <ros2_control name="${name}" type="system">
+
+      <hardware>
+        <xacro:if value="${use_gz_sim}">
+          <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        </xacro:if>
+
+        <xacro:unless value="${use_gz_sim}">
+          <xacro:if value="${use_mock_hardware}">
+            <plugin>mock_components/GenericSystem</plugin>
+            <param name="calculate_dynamics">true</param>
+          </xacro:if>
+
+          <xacro:unless value="${use_mock_hardware}">
+            <plugin>calixto_ros_bot/DiffBotSystemHardware</plugin>
+            <param name="left_wheel_name">${prefix}left_wheel_joint</param>
+            <param name="right_wheel_name">${prefix}right_wheel_joint</param>
+            <param name="device">${serial_port}</param>
+            <param name="baud_rate">115200</param>
+            <param name="timeout_ms">30</param>
+            <param name="loop_rate">20.0</param>
+            <!-- TEMPORARY empirical value (2026-10-01) - see PENDING_ISSUES.md
+                 "Encoder counts/rev mismatch". Documented spec is 4096
+                 (L2DB4830 hub-motor, 12-bit magnetic encoder, direct drive),
+                 but two independent physical measurements (wheel marked,
+                 rotations counted by eye against exact telemetry tick
+                 deltas) gave ~5618 ticks/real wheel revolution instead -
+                 consistently, across two different run lengths/wheels.
+                 Root cause NOT yet confirmed - leading theory is a
+                 drive-side (DS20270C) position-scaling object left over
+                 from this drive's original pallet-shuttle commissioning,
+                 not an actual mechanical gear ratio (this is a direct-drive
+                 hub motor). This value compensates on the ROS2 side only,
+                 by owner's explicit instruction, pending a proper firmware-
+                 side fix (see PENDING_ISSUES.md) next time the i.MX RT is
+                 reflashed. Re-measure more precisely before trusting this
+                 for anything beyond rough odometry. -->
+            <param name="enc_counts_per_rev">5618</param>
+          </xacro:unless>
+        </xacro:unless>
+      </hardware>
+
+      <joint name="${prefix}left_wheel_joint">
+        <command_interface name="velocity"/>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+
+      <joint name="${prefix}right_wheel_joint">
+        <command_interface name="velocity"/>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+
+    </ros2_control>
+
+  </xacro:macro>
+
+</robot>

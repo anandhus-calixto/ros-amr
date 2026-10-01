@@ -1,0 +1,51 @@
+# calixto-ros-bot/config/ekf.yaml
+ekf_filter_node:
+  ros__parameters:
+    frequency: 10.0
+    sensor_timeout: 0.5
+    two_d_mode: true
+    publish_tf: true
+
+    map_frame: map              # Defaults to 'map'
+    odom_frame: odom            # Defaults to 'odom'
+    base_link_frame: base_link  # Defaults to 'base_link'
+    world_frame: odom           # Set to 'odom' for local localization
+
+    # Wheel Odometry (from diffbot_base_controller)
+    odom0: /diffbot_base_controller/odom                
+    odom0_config: [false, false, false, # x, y, z
+               	   false, false, false, # roll, pitch, yaw
+                   true,  false, false, # vx (Linear velocity)
+                   false, false, false,  # v_yaw (Angular velocity)
+                   false, false, false]
+    # IMU Data
+    imu0: /bno055/imu
+    imu0_config: [false, false, false, # x, y, z
+                  false, false, true,  # roll, pitch, YAW (Absolute)
+                  false, false, false, # vx, vy, vz
+                  false, false, true,  # d_roll, d_pitch, d_YAW (Velocity)
+                  false, false, false] # ax, ay, az (Set to false until calibration is 3)
+    imu0_relative: false
+    
+# try this example for the imu fusing for the x motion also to prevent the wheel slip (try it and find the difference next time).    
+#ekf_node:
+#  ros__parameters:
+#    frequency: 50.0
+#    sensor_timeout: 0.1
+#    two_d_mode: true
+#
+#    odom0: /wheel/odometry
+#    odom0_config: [false, false, false,
+#                   false, false, false,
+#                   true,  false, false,   # vx
+#                   false, false, true,    # vyaw
+#                   false, false, false]
+#
+#    imu0: /imu/data
+#    imu0_config: [false, false, false,
+#                  false, false, false,
+#                  false, false, false,
+#                  false, false, true,    # gyro Z → yaw rate
+#                  true,  false, false]   # accel X → forward
+#    imu0_remove_gravitational_acceleration: true
+#    imu0_differential: false    

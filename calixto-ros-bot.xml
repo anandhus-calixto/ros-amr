@@ -1,0 +1,9 @@
+<library path="calixto_hardware">
+  <class name="calixto_ros_bot/DiffBotSystemHardware"
+         type="calixto_ros_bot::DiffBotSystemHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      The Calixto Bot hardware implementation.
+    </description>
+  </class>
+</library>

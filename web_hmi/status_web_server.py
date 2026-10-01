@@ -68,7 +68,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
@@ -140,7 +140,15 @@ class HmiNode(Node):
         self.create_subscription(Odometry, "/diffbot_base_controller/odom", self._on_odom, 10)
         self._mode_pub = self.create_publisher(String, "/hmi/cmd_vel_mode", _LATCHED_QOS)
         self._goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
-        self._teleop_pub = self.create_publisher(TwistStamped, "/cmd_vel_teleop", 10)
+        # Plain Twist (2026-10-01), not TwistStamped - twist_mux (the sole
+        # subscriber on this topic) only supports plain geometry_msgs/Twist
+        # inputs in the installed version (4.3.0), no stamped variant. A
+        # type mismatch here means the two endpoints never connect at all
+        # (ROS2 requires an exact type match, topic name alone isn't
+        # enough) - confirmed on hardware: keyboard teleop silently
+        # produced zero motion despite the mode/topic/subscriber count all
+        # looking correct, because of exactly this.
+        self._teleop_pub = self.create_publisher(Twist, "/cmd_vel_teleop", 10)
         self.get_logger().info("Subscribed to /mcu_status, /hmi/cmd_vel_active_source, /diffbot_base_controller/odom")
 
     def _on_status(self, msg: DiagnosticArray):
@@ -193,10 +201,9 @@ class HmiNode(Node):
         self.get_logger().info(f"Published /goal_pose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
 
     def publish_teleop(self, linear: float, angular: float):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.twist.linear.x = linear
-        msg.twist.angular.z = angular
+        msg = Twist()
+        msg.linear.x = linear
+        msg.angular.z = angular
         self._teleop_pub.publish(msg)
 
 
@@ -959,9 +966,12 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8080)
-    args = ap.parse_args()
+    # parse_known_args(), not parse_args() - leaves standard ROS2 args
+    # (--ros-args -r old:=new, etc.) for rclpy to consume below instead of
+    # argparse rejecting them as unrecognized.
+    args, ros_args = ap.parse_known_args()
 
-    rclpy.init()
+    rclpy.init(args=ros_args)
     node = HmiNode()
 
     def _spin():

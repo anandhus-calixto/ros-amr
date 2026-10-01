@@ -114,6 +114,11 @@ hardware_interface::CallbackReturn DiffBotSystemHardware::on_activate(
   RCLCPP_INFO(get_logger(), "Activating ...please wait...");
   comms_.connect(cfg_.device, cfg_.baud_rate, cfg_.timeout_ms);
 
+  // Re-arm the encoder tare for this activation - see the field's own
+  // comment in diffbot_system.hpp. Taken on the first successful read()
+  // below, not here, since the MCU link may not be ready to reply yet.
+  ticks_zeroed_ = false;
+
   // MCU status publisher (2026-09-30) - a bare node just for this one
   // publisher; no executor/spin needed since it never subscribes to
   // anything, only ever calls publish(). See mcu_comms.hpp's status_flags()
@@ -159,13 +164,24 @@ hardware_interface::return_type DiffBotSystemHardware::read(
     return hardware_interface::return_type::OK;
   }
 
+  // Tare the encoder reference on the first successful read after
+  // activation - see this field's comment in diffbot_system.hpp for why.
+  if (!ticks_zeroed_)
+  {
+    left_ticks_offset_ = left_ticks;
+    right_ticks_offset_ = right_ticks;
+    ticks_zeroed_ = true;
+    RCLCPP_INFO(get_logger(), "Encoder zero reference captured: left=%d right=%d",
+      left_ticks_offset_, right_ticks_offset_);
+  }
+
   // Store previous positions for velocity calculation
   double prev_left = wheel_left_.pos;
   double prev_right = wheel_right_.pos;
 
-  // Convert ticks to radians
-  wheel_left_.pos = left_ticks * wheel_left_.rads_per_count;
-  wheel_right_.pos = right_ticks * wheel_right_.rads_per_count;
+  // Convert ticks to radians, relative to this activation's zero reference.
+  wheel_left_.pos = (left_ticks - left_ticks_offset_) * wheel_left_.rads_per_count;
+  wheel_right_.pos = (right_ticks - right_ticks_offset_) * wheel_right_.rads_per_count;
 
   // Velocity = delta position / delta time
   double dt = period.seconds();

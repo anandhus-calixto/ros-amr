@@ -32,7 +32,12 @@ diffbot_base_controller:
     twist_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
 
     open_loop: false
-    enable_odom_tf: true #if no imu , true then -- TEMP for hardware verification (2026-09-29): no bno055 IMU is running, so the EKF has no yaw source; enabled here per this comment's own guidance. Revert to false once the IMU is wired up and the EKF-based launch is used again.
+    # Reverted to false (2026-10-01): the bno055 IMU is now wired up and
+    # diffbot.launch.py's EKF node fuses wheel odom + IMU, so the EKF owns
+    # the odom->base_link TF instead - leaving this true would fight it for
+    # the same transform (duplicate publisher), per this file's own
+    # 2026-09-29 TEMP note.
+    enable_odom_tf: false
     cmd_vel_timeout: 0.5
 
     linear.x.has_velocity_limits: true 

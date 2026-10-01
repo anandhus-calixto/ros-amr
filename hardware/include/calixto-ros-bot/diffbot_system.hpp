@@ -71,6 +71,22 @@ private:
 
   Wheel wheel_left_, wheel_right_;
 
+  // Encoder tare/zero reference (2026-10-01). The MCU's raw encoder ticks
+  // are an absolute counter that never resets - it keeps accumulating
+  // across every past session since the firmware last booted. Without
+  // taring, the first read() after activation would treat that entire
+  // history as "current position," producing one huge bogus jump that
+  // diff_drive_controller's odometry integral then carries forever (seen
+  // on hardware: ~48m/26m position + spurious yaw from a few seconds of
+  // real driving, right after hours of earlier unrelated manual testing
+  // had already spun the real motors a lot). Captured on the first
+  // successful read() after each activation, not in on_activate() itself,
+  // since the MCU link may not be ready to reply the instant comms_.connect()
+  // returns.
+  bool ticks_zeroed_{false};
+  int32_t left_ticks_offset_{0};
+  int32_t right_ticks_offset_{0};
+
   std::shared_ptr<rclcpp::Logger> logger_;   // added
   rclcpp::Clock::SharedPtr clock_;           // added
 

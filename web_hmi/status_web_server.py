@@ -17,18 +17,28 @@ Subscribes to:
          pannable/zoomable HTML5 <canvas> (RViz-style "north-up" grid; the
          robot moves within it, the view doesn't recentre on its own).
 Publishes:
-  - /hmi/cmd_vel_mode (std_msgs/String) - drive mode selection, unchanged.
+  - /hmi/cmd_vel_mode (std_msgs/String) - "teleop" or "none", purely for this
+    page's own keyboard/joystick on-off state (2026-10-01: simplified from a
+    3-way "drive mode" selector - real twist_mux, unlike the old cmd_vel_mux.py
+    this originally targeted, has no concept of a selected mode at all; it
+    only ever does fixed-priority arbitration on whichever cmd_vel_* topics
+    are actually publishing. "Remote" and "Navigation" buttons never gated
+    anything even before this change, so they're gone - see the "RF remote"/
+    "Navigation" panels in the HTML below, now always-visible reference info
+    instead of fake toggles).
   - /goal_pose (geometry_msgs/PoseStamped) - click-and-drag on the canvas
     sets a goal position + heading (drag direction = heading), published in
     the odom frame since there's no map/localization yet. Nav2 isn't running
     on the real robot yet either, so this currently publishes into the void,
-    but it's wired up and ready for when both exist.
-  - /cmd_vel_teleop (geometry_msgs/TwistStamped) - keyboard teleop straight
-    from the browser (2026-10-01): the exact same u/i/o/j/k/l/m/,/. bindings
-    as `ros2 run teleop_twist_keyboard`, captured by the page's own keydown/
+    but it's wired up and ready for when both exist. Always active, not
+    gated by any mode selection.
+  - /cmd_vel_teleop (geometry_msgs/Twist, plain - not TwistStamped, see
+    publish_teleop()'s comment) - keyboard teleop straight from the browser
+    (2026-10-01): the exact same u/i/o/j/k/l/m/,/. bindings as
+    `ros2 run teleop_twist_keyboard`, captured by the page's own keydown/
     keyup handlers and POSTed to /teleop, instead of asking the user to run
-    that node in a separate terminal. Only active while "Teleop" drive mode
-    is selected. See MODE_PANELS.teleop in the JS below for the exact keys.
+    that node in a separate terminal. Only active while keyboard control is
+    toggled on. See TELEOP_PANEL in the JS below for the exact keys.
 
 There's no LIDAR or map yet, so the canvas only draws a grid + the live pose
 + a breadcrumb trail for now. Known gap: no /map or /scan subscription yet -
@@ -73,7 +83,7 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
 _LEVEL_NAMES = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
-_VALID_MODES = {"auto", "remote", "teleop", "nav"}  # must match config/cmd_vel_mux.yaml's topics.* keys
+_VALID_MODES = {"none", "teleop"}  # the only two states the page itself can toggle - see setMode()'s comment
 _LATCHED_QOS = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
 # Snap-package environment pollution fix (see the RViz2 "undefined symbol:
@@ -326,15 +336,35 @@ HTML_PAGE = """<!doctype html>
       <div id="conn" class="hint">connecting...</div>
 
       <h2>Drive mode</h2>
+      <div class="hint">Priority is fixed, not selectable: the RF remote always wins when it's
+      actively being used, then this page's keyboard/joystick, then navigation goals - whichever
+      of those is actually sending a command drives the robot. The only thing to toggle here is
+      whether <em>this browser tab's</em> keyboard/joystick is live.</div>
       <div class="modes">
-        <button data-mode="remote">Remote</button>
-        <button data-mode="teleop">Keyboard</button>
-        <button data-mode="nav">Navigation</button>
+        <button data-mode="teleop">Keyboard control: OFF</button>
       </div>
-      <div class="hint">By default, whichever of these is actually publishing drives the robot
-      (remote takes priority over keyboard, which takes priority over navigation). Picking one
-      below locks it in exclusively.</div>
       <div id="mode-panel" class="mode-panel"></div>
+
+      <h2>RF remote</h2>
+      <div class="mode-panel">
+        <strong>Button mapping</strong> (always active, highest priority - no toggle needed):
+        <table class="remote-map"><tbody>
+          <tr><td>Top</td><td>Drive forward</td></tr>
+          <tr><td>Down</td><td>Drive backward</td></tr>
+          <tr><td>Left</td><td>Pivot left (CCW)</td></tr>
+          <tr><td>Right</td><td>Pivot right (CW)</td></tr>
+          <tr><td>Centre</td><td>Stop</td></tr>
+        </tbody></table>
+        <div class="hint">Run alongside: <code>python3 web_hmi/remote_ros_node.py</code>. Stops
+        automatically if the remote goes silent for &gt;1.5s.</div>
+      </div>
+
+      <h2>Navigation</h2>
+      <div class="mode-panel">
+        Nav2 isn't running on the real robot yet (needs LIDAR integration first), but goal-setting
+        is already wired up and always active: click and drag on the map to the left to publish a
+        goal on /goal_pose (drag direction sets heading). It just has nothing listening yet.
+      </div>
     </aside>
   </div>
 
@@ -414,21 +444,7 @@ async function pollActive() {
 // Exact key bindings from ros2 run teleop_twist_keyboard teleop_twist_keyboard
 // (its own printed banner) - i/,/j/l drive, u/o/m/. are diagonals, k or any
 // other key stops.
-const MODE_PANELS = {
-  none: `No drive mode selected - by default, whichever of remote/keyboard/navigation is
-    actually publishing drives the robot (remote &gt; keyboard &gt; navigation priority).
-    Pick one above to lock it in exclusively.`,
-  remote: `<strong>RF remote button mapping</strong> (physical remote, priority 150):
-    <table class="remote-map"><tbody>
-      <tr><td>Top</td><td>Drive forward</td></tr>
-      <tr><td>Down</td><td>Drive backward</td></tr>
-      <tr><td>Left</td><td>Pivot left (CCW)</td></tr>
-      <tr><td>Right</td><td>Pivot right (CW)</td></tr>
-      <tr><td>Centre</td><td>Stop</td></tr>
-    </tbody></table>
-    <div class="hint">Run alongside: <code>python3 web_hmi/remote_ros_node.py</code>. Stops
-    automatically if the remote goes silent for &gt;1.5s.</div>`,
-  teleop: `<strong>Keyboard teleop</strong> - drives straight from this page, no terminal needed.
+const TELEOP_PANEL = `<strong>Keyboard teleop</strong> - drives straight from this page, no terminal needed.
     Just press the keys below (this browser tab needs focus, but not any particular element in it):
     <div class="keygrid">
       <span data-key="u">u</span><span data-key="i">i</span><span data-key="o">o</span>
@@ -437,19 +453,15 @@ const MODE_PANELS = {
     </div>
     i/, = forward/backward, j/l = pivot left/right, u/o/m/. = diagonal, k or releasing = stop.
     <div class="hint">Same bindings as <code>ros2 run teleop_twist_keyboard</code> - captured by this
-    page's own keydown/keyup handlers and published on /cmd_vel_teleop instead.</div>`,
-  nav: `<strong>Navigation</strong> - Nav2 isn't running on the real robot yet (needs LIDAR + IMU
-    integration first), but goal-setting is already wired up: click and drag on the map to the
-    left to publish a goal on /goal_pose (drag direction sets heading). It just has nothing
-    listening yet. Selecting this drive mode itself just stops the robot, since nothing
-    publishes to /cmd_vel_nav.`,
-};
+    page's own keydown/keyup handlers and published on /cmd_vel_teleop instead.</div>`;
 
-function renderModePanel(mode) {
-  modePanelEl.innerHTML = MODE_PANELS[mode] || '';
-}
-
-let currentMode = 'none';  // no explicit mode selected yet - matches cmd_vel_mux's own default
+// One on/off toggle now, not a 3-way mode selector (2026-10-01) - "Remote"
+// and "Navigation" never gated anything here even before this simplification
+// (real twist_mux has no concept of a selected mode; it just arbitrates by
+// fixed priority on whichever cmd_vel_* topics are actually publishing).
+// The only thing this page can actually turn on/off is its own keyboard/
+// joystick capture, so that's the only toggle left.
+let currentMode = 'none';
 
 async function setMode(mode) {
   if (currentMode === 'teleop' && mode !== 'teleop') {
@@ -457,8 +469,10 @@ async function setMode(mode) {
     endJoystick();     // same for the joystick, if it was mid-drag
   }
   currentMode = mode;
-  modeButtons.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
-  renderModePanel(mode);
+  const btn = modeButtons[0];
+  btn.textContent = mode === 'teleop' ? 'Keyboard control: ON' : 'Keyboard control: OFF';
+  btn.classList.toggle('active', mode === 'teleop');
+  modePanelEl.innerHTML = mode === 'teleop' ? TELEOP_PANEL : '';
   setJoystickVisible(mode === 'teleop');
   try {
     await fetch('/mode', { method: 'POST', body: mode });
@@ -466,11 +480,7 @@ async function setMode(mode) {
     activeBadge.textContent = 'Failed to set mode';
   }
 }
-modeButtons.forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
-// Show the "none selected" panel on load without publishing anything - a
-// page refresh should never silently change what's actually driving the
-// robot. The mode only actually changes when a button is clicked.
-renderModePanel('none');
+modeButtons.forEach(b => b.addEventListener('click', () => setMode(currentMode === 'teleop' ? 'none' : 'teleop')));
 
 // ---- Keyboard teleop (only active while currentMode === 'teleop') ----
 // Exact bindings from teleop_twist_keyboard's own moveBindings table

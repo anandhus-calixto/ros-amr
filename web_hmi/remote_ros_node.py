@@ -179,6 +179,20 @@ class RemoteCmdVelPublisher(Node):
         else:
             self._warned_stale = False
 
+        # Don't publish while genuinely idle (2026-10-01) - twist_mux locks
+        # onto whichever higher-priority source has published within its
+        # timeout window REGARDLESS of the value, so a continuous
+        # idle-zero stream at priority 150 would permanently block teleop
+        # (100) from ever being selected, even with no one touching the
+        # remote (confirmed on hardware: this exact bug silenced keyboard
+        # teleop entirely once the remote node started running). Skipping
+        # the publish while idle lets twist_mux's 0.5s timeout for this
+        # topic expire naturally, falling through to the next-priority
+        # source. RELEASE/NO SIGNAL/every active button still publish
+        # explicitly below, so a real stop command is never skipped.
+        if label == "FREE (idle)":
+            return
+
         msg = Twist()
         msg.linear.x = linear
         msg.angular.z = angular

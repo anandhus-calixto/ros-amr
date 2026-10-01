@@ -114,3 +114,64 @@ remote's stable `/dev/serial/by-id/...` paths instead of `/dev/ttyUSB0`/`1`,
 which renumber across reboots/replugs. If either physical device is ever
 swapped, check `ls /dev/serial/by-id/` and pass the new path, e.g.
 `./run_hmi.sh serial_port:=/dev/serial/by-id/...`.
+
+## Porting to i.MX8M Plus / i.MX95 (Docker)
+
+ROS2 Humble's only officially supported binary target is Ubuntu 22.04
+(Jammy) - it isn't packaged for Debian at all, which is what the i.MX8M
+Plus (and later the i.MX95) actually run. Rather than fight that mismatch
+on the host OS directly, ROS2 runs inside a Docker container built from
+`docker/Dockerfile` - same image, same steps, on any aarch64 board.
+
+**Opening the container after SSHing into the board:**
+
+```bash
+ssh root@<board-ip>          # e.g. ssh root@192.168.1.62, or your own ssh alias
+docker exec -it ros2_humble bash
+```
+
+That's it for day-to-day use - the container (`ros2_humble`) is already
+running persistently (`--restart=always`), so it survives reboots and just
+needs `docker exec`-ing into, not starting fresh each time. Check it's up
+first with `docker ps` if unsure.
+
+**First-time setup on a new board** (or after wiping it):
+
+```bash
+mkdir -p ~/ros2_ws/src
+git clone https://github.com/anandhus-calixto/ros-amr.git ~/ros2_ws/src/ros-amr
+~/ros2_ws/src/ros-amr/docker/run_container.sh      # builds the image, starts the container
+docker exec -it ros2_humble bash /ros2_ws/src/ros-amr/docker/setup_workspace.sh
+```
+
+`run_container.sh` is also what you re-run any time `docker/Dockerfile`
+changes (e.g. a new system dependency) - it rebuilds the image and replaces
+the container, but never touches the bind-mounted `~/ros2_ws`, so your
+cloned source and colcon build artifacts survive. See `docker/Dockerfile`'s
+own header comment for what's installed and why, and the device/permission
+note there (currently `--privileged` for development simplicity - revisit
+once cameras/LIDAR are actually connected).
+
+**WiFi dongle (TP-Link AC600 / RTL8811AU) not surviving a reboot:**
+
+If `lsmod | grep 8821au` comes back empty after a board reset (no
+`wlx...` interface, container unreachable over the network), the
+`8821au.ko` module and its `/etc/modules-load.d/8821au.conf` boot entry
+can both be correctly in place and it will *still* fail silently at boot
+with `systemd-modules-load[...]: Failed to find module '8821au'`
+(`journalctl -u systemd-modules-load.service -b`). The cause is a stale
+`modules.dep`: the out-of-tree `.ko` was dropped into
+`/lib/modules/$(uname -r)/kernel/drivers/net/wireless/` without ever
+running `depmod`, so `modprobe` (what systemd's boot-time loader uses)
+can't resolve the module name, even though a manual
+`insmod <full-path-to-8821au.ko>` works fine (it bypasses that lookup
+entirely, which is why it's easy to "fix" by hand and have it silently
+break again on the next reboot). Fix once with:
+
+```bash
+depmod -a
+```
+
+then confirm with `modprobe 8821au` and `ip link show`. This regenerates
+`modules.dep` on the board's persistent rootfs, so it survives future
+reboots - verified across a real reboot, not just a hot `modprobe`.

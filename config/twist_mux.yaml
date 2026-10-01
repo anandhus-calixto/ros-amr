@@ -9,3 +9,7 @@ twist_mux:
         topic: cmd_vel_teleop
         timeout: 0.5
         priority: 100
+      remote:
+        topic: cmd_vel_remote
+        timeout: 0.5
+        priority: 150

@@ -39,7 +39,7 @@ import serial
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped
 
 DEFAULT_REMOTE_DEVICE = None  # None = auto-detect the first /dev/ttyUSB*
 DEFAULT_REMOTE_BAUD = 115200
@@ -152,13 +152,18 @@ class RemoteReader(threading.Thread):
 
 
 class RemoteCmdVelPublisher(Node):
-    def __init__(self, reader, rate, watchdog_timeout, frame_id):
+    def __init__(self, reader, rate, watchdog_timeout):
         super().__init__("remote_cmd_vel_publisher")
         self._reader = reader
         self._watchdog_timeout = watchdog_timeout
-        self._frame_id = frame_id
         self._warned_stale = False
-        self._pub = self.create_publisher(TwistStamped, "/cmd_vel_remote", 10)
+        # Plain Twist (2026-10-01), not TwistStamped - twist_mux (the sole
+        # subscriber on this topic in the i.MX8M Plus setup) only supports
+        # plain geometry_msgs/Twist inputs in the installed version (4.3.0).
+        # A type mismatch here means the two endpoints never connect at all
+        # (confirmed on hardware with the identical /cmd_vel_teleop bug -
+        # see status_web_server.py's publish_teleop for the same fix).
+        self._pub = self.create_publisher(Twist, "/cmd_vel_remote", 10)
         self.create_timer(1.0 / rate, self._tick)
 
     def _tick(self):
@@ -174,11 +179,9 @@ class RemoteCmdVelPublisher(Node):
         else:
             self._warned_stale = False
 
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self._frame_id
-        msg.twist.linear.x = linear
-        msg.twist.angular.z = angular
+        msg = Twist()
+        msg.linear.x = linear
+        msg.angular.z = angular
         self._pub.publish(msg)
 
         self.get_logger().info(f"remote={label} -> linear.x={linear:.3f} angular.z={angular:.3f}", throttle_duration_sec=1.0)
@@ -198,7 +201,6 @@ def main():
                      help="Stop if no remote frame arrives for this many seconds (default 1.5; "
                           "must be > 1.0s since the remote's own idle heartbeat is 1 Hz, or every "
                           "idle gap falsely triggers this)")
-    ap.add_argument("--frame-id", default="", help="header.frame_id for published TwistStamped messages")
     args, ros_args = ap.parse_known_args()
 
     remote_port = args.remote_device or find_remote_port()
@@ -208,7 +210,7 @@ def main():
     reader.start()
 
     rclpy.init(args=ros_args)
-    node = RemoteCmdVelPublisher(reader, args.rate, args.watchdog_timeout, args.frame_id)
+    node = RemoteCmdVelPublisher(reader, args.rate, args.watchdog_timeout)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -115,6 +115,44 @@ which renumber across reboots/replugs. If either physical device is ever
 swapped, check `ls /dev/serial/by-id/` and pass the new path, e.g.
 `./run_hmi.sh serial_port:=/dev/serial/by-id/...`.
 
+## RF remote control
+
+`web_hmi/remote_ros_node.py` reads the RF remote's receiver (a CH340 USB-
+serial adapter) and publishes `geometry_msgs/Twist` on `/cmd_vel_remote`
+(plain `Twist`, not `TwistStamped` - see the file's own comment; same
+silent-type-mismatch class of bug as `/cmd_vel_teleop` originally had).
+`config/twist_mux.yaml` gives it priority 150 - higher than teleop (100)
+and navigation (10), so the remote always wins when active.
+
+**On the i.MX8M Plus specifically**, the CH340 needed a kernel fix before
+any of this would work at all: `/dev/ttyUSB0` never appeared, because this
+board's kernel has `CONFIG_USB_SERIAL=y` (the framework) but
+`CONFIG_USB_SERIAL_CH341` was never enabled. Fixed the same way as the
+RTL8811AU WiFi driver earlier - built `ch341.ko` as a standalone
+out-of-tree module against the matching kernel source
+(`/media/calixto/drive_a/BSP/nxp/imx8mp-linux`, same Yocto SDK
+cross-toolchain), copied it to `/lib/modules/$(uname -r)/kernel/drivers/usb/serial/`,
+`depmod -a`, and `echo ch341 > /etc/modules-load.d/ch341.conf` for
+boot persistence (the WiFi depmod lesson: a `.ko` file alone doesn't
+survive reboot without this).
+
+Two further gotchas specific to the Docker setup:
+- **Hot-plugged devices need a container restart to appear.** Unlike
+  `/dev/ttymxc2` (present since boot, works immediately), `/dev/ttyUSB0`
+  only showed up inside the container after `docker restart ros2_humble` -
+  this `--privileged` container's own `/dev` doesn't pick up devices that
+  first appear (or whose driver first loads) after the container is
+  already running.
+- **`/dev/serial/by-id/` stable paths aren't visible inside the
+  container at all** (no udev daemon running in-container to recreate
+  those symlinks from the raw device nodes `--privileged` passes through).
+  `remote_ros_node.py` falls back to plain `/dev/ttyUSB0`, fine while it's
+  the only USB-serial adapter - if a second one is ever added, either pass
+  `--remote-device` explicitly and check `dmesg`/`lsusb` to tell them
+  apart, or add an explicit `-v /dev:/dev` bind mount to
+  `docker/run_container.sh` to get the host's real by-id symlinks inside
+  the container.
+
 ## Porting to i.MX8M Plus / i.MX95 (Docker)
 
 ROS2 Humble's only officially supported binary target is Ubuntu 22.04

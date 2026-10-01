@@ -48,9 +48,13 @@ echo "[4/5] Starting twist_stamper relay ..."
 python3 /ros2_ws/src/ros-amr/scripts/twist_stamper.py > /tmp/twist_stamper_stack.log 2>&1 &
 sleep 2
 
-echo "[5/5] Starting web HMI (port 8080, odom remapped to /odometry/filtered) ..."
+echo "[5/6] Starting web HMI (port 8080, odom remapped to /odometry/filtered) ..."
 python3 /ros2_ws/src/ros-amr/web_hmi/status_web_server.py --port 8080 --ros-args \
     -r /diffbot_base_controller/odom:=/odometry/filtered > /tmp/status_hmi_stack.log 2>&1 &
 sleep 3
+
+echo "[6/6] Starting RF remote control (requires the ch341 kernel module - see README) ..."
+python3 /ros2_ws/src/ros-amr/web_hmi/remote_ros_node.py > /tmp/remote_node_stack.log 2>&1 &
+sleep 2
 
 echo "Done. HMI: http://<board-ip>:8080  -  logs in /tmp/*_stack.log inside the container."

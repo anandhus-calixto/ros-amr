@@ -2,6 +2,21 @@
 
 Running list of known gaps/temporary fixes that need real follow-up. Newest on top.
 
+## 2026-10-01 — RF remote control integrated, two Docker/USB gotchas left open
+
+RF remote now fully wired (see README's "RF remote control" section for
+the full writeup and the `ch341` kernel module fix). Two follow-ups not
+done yet, low priority unless they start actually causing problems:
+
+- `docker/run_container.sh` doesn't bind-mount `/dev` into the container,
+  so `/dev/serial/by-id/` stable paths aren't visible in-container - only
+  raw `/dev/ttyUSB0`-style paths work, which can renumber if a second
+  USB-serial adapter is ever added. Fix: add `-v /dev:/dev` if/when that
+  becomes a real problem.
+- Hot-plugged USB devices (or a driver loaded after container start) don't
+  appear inside this `--privileged` container until it's restarted - not
+  obviously fixable without the `-v /dev:/dev` change above either.
+
 ## 2026-10-01 — Encoder counts/rev mismatch (temporary ROS-side fix applied)
 
 **What's wrong:** `description/diffbot.ros2_control.xacro`'s `enc_counts_per_rev`

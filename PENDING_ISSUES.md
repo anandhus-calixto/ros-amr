@@ -2,6 +2,38 @@
 
 Running list of known gaps/temporary fixes that need real follow-up. Newest on top.
 
+## 2026-10-01 — Wheel-slip detection via IMU (deferred until floor deployment)
+
+Owner's request: detect a wheel slipping/losing traction (e.g. dropping
+into a gutter) as a new exceptional/safety case, using the IMU as an
+independent cross-check against wheel encoder data (wheels can report
+"motion" via encoders while the chassis isn't actually moving/rotating
+that way - a slipping or stuck wheel). Deliberately **not implemented
+yet** - owner wants to do this once the robot is actually deployed on
+the floor, since the real-world thresholds (how much wheel-vs-IMU
+mismatch is normal noise vs. real slip) can't be meaningfully tuned on
+a bench.
+
+Design sketch for whenever this is picked up again:
+- **Rotational slip**: compare wheel-odometry-implied yaw rate
+  (`/diffbot_base_controller/odom` twist.angular.z) against the BNO055's
+  own raw gyro (`/bno055/imu` angular_velocity.z, not the EKF-fused
+  output - fusing already trusts wheel data, so comparing against the
+  fused estimate wouldn't be an independent check). Sustained mismatch
+  beyond some threshold/duration = flag.
+- **Linear slip/stall** ("stuck in a gutter"): steady-state accelerometer
+  comparison doesn't work (constant velocity = ~zero acceleration either
+  way, slipping or not) - instead watch for a *commanded ramp-up* in
+  wheel velocity with no corresponding kick in the IMU's gravity-
+  compensated linear acceleration *magnitude* (orientation-independent,
+  since the IMU's final mounting angle on the chassis isn't nailed down
+  yet either).
+- Publish as a new diagnostic (same `diagnostic_msgs/DiagnosticArray`
+  pattern as `/mcu_status`) so it can plug into the HMI's AMR Status box
+  the same way E-stop/bumper/CAN-fault already do.
+- Thresholds will need real tuning on the actual floor surface(s) this
+  robot runs on - don't hardcode guessed values and assume they're right.
+
 ## 2026-10-01 — RF remote control integrated, two Docker/USB gotchas left open
 
 RF remote now fully wired (see README's "RF remote control" section for

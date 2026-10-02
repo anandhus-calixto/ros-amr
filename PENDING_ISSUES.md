@@ -2,6 +2,41 @@
 
 Running list of known gaps/temporary fixes that need real follow-up. Newest on top.
 
+## 2026-10-02 — Wheel direction invert flipped between two restarts (watch for recurrence)
+
+After the owner rewired the board onto a flat surface, the right wheel
+span backward when driven straight. Fixed with a ROS2-side per-wheel
+invert (`invert_left`/`invert_right` in `diffbot.ros2_control.xacro` -
+see that file's own comment and `hardware/diffbot_system.cpp`'s cfg_
+comment for the full mechanism) - deliberately a config value, not a
+firmware change, per the owner's explicit instruction.
+
+**Then it flipped again on its own.** Restarted the board (no deliberate
+rewiring in between) and the *exact same* `invert_right=true` config,
+sending the *exact same* commanded signs as the verified-working test,
+produced the *opposite* real-world result (right wheel backward again).
+Toggled to `invert_right=false`, confirmed correct, survived one more
+restart since (2026-10-02).
+
+**Ruled out**: CANopen node-ID auto-discovery non-determinism - checked
+`src/motor_can/motor_config.h` in the firmware repo directly,
+`DS_AXIS_A_NODE_ID`/`DS_AXIS_B_NODE_ID` are fixed (1/2), not discovered
+at boot, so this isn't a "random enumeration order" software issue.
+
+**Leading theory, not confirmed**: a loose or unkeyed motor/CAN
+connector that can physically reseat in either of two valid orientations
+depending on handling/vibration during a restart - would explain
+identical software behaving differently across power cycles with no
+deliberate rewiring.
+
+**What to check next time this comes up**: has `invert_right` stayed
+`false` (correct) across several more restarts/power cycles with nothing
+physically touched? If yes for a good while, probably settled - consider
+this resolved. If it flips again on its own, that confirms the loose-
+connector theory - the real fix at that point is physical (secure/key
+the connector) rather than yet another config toggle, since a config
+value can't reliably compensate for a connection that isn't stable.
+
 ## 2026-10-01 — Wheel-slip detection via IMU (deferred until floor deployment)
 
 Owner's request: detect a wheel slipping/losing traction (e.g. dropping

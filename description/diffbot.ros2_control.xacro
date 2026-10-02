@@ -41,6 +41,16 @@
                  reflashed. Re-measure more precisely before trusting this
                  for anything beyond rough odometry. -->
             <param name="enc_counts_per_rev">5618</param>
+            <!-- Per-wheel direction invert (2026-10-02) - see this param's
+                 own comment in diffbot_system.cpp for why this is a ROS2-
+                 side config value and not a firmware fix. Current real
+                 wiring: right wheel physically spins backward for a given
+                 command sign (confirmed on hardware driving straight -
+                 right wheel visibly reversed). If a future
+                 unplug/rewire flips this again, fix it HERE (flip true/
+                 false below) rather than touching firmware. -->
+            <param name="invert_left">false</param>
+            <param name="invert_right">true</param>
           </xacro:unless>
         </xacro:unless>
       </hardware>

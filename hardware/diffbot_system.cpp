@@ -40,6 +40,27 @@ hardware_interface::CallbackReturn DiffBotSystemHardware::on_init(
   cfg_.timeout_ms       = std::stoi(info_.hardware_parameters["timeout_ms"]);
   cfg_.enc_counts_per_rev = std::stoi(info_.hardware_parameters["enc_counts_per_rev"]);
 
+  // Per-wheel direction invert (2026-10-02) - a physical rewiring/reconnection
+  // of the motor/CAN cabling can swap which physical wheel spins which way
+  // for the same commanded sign, independent of anything in firmware (the
+  // firmware's own motor_set_invert() fixes a *mechanical mirror-mounting*
+  // mismatch between the two axes, a one-time fact about how the wheels are
+  // bolted on - this is a separate, *wiring-connection* mismatch that can
+  // recur any time the motor/CAN connectors are unplugged and replugged).
+  // Fixed here instead of by touching firmware again - a config flip, not a
+  // reflash, next time this happens. Inverts both the command sent out AND
+  // the encoder ticks read back for that wheel, so odometry direction stays
+  // correct too - inverting only one half would silently break odometry
+  // even if the physical motion looked right.
+  auto get_bool_param = [this](const std::string & key, bool def)
+  {
+    auto it = info_.hardware_parameters.find(key);
+    if (it == info_.hardware_parameters.end()) { return def; }
+    return it->second == "true" || it->second == "1";
+  };
+  cfg_.invert_left  = get_bool_param("invert_left", false);
+  cfg_.invert_right = get_bool_param("invert_right", false);
+
   // Setup both wheels
   wheel_left_.setup(cfg_.left_wheel_name,   cfg_.enc_counts_per_rev);
   wheel_right_.setup(cfg_.right_wheel_name, cfg_.enc_counts_per_rev);
@@ -180,8 +201,14 @@ hardware_interface::return_type DiffBotSystemHardware::read(
   double prev_right = wheel_right_.pos;
 
   // Convert ticks to radians, relative to this activation's zero reference.
-  wheel_left_.pos = (left_ticks - left_ticks_offset_) * wheel_left_.rads_per_count;
-  wheel_right_.pos = (right_ticks - right_ticks_offset_) * wheel_right_.rads_per_count;
+  // Per-wheel invert applied here too (not just in write()) - see cfg_'s
+  // own comment: inverting only the command and not the encoder reading
+  // would silently corrupt odometry even though the physical motion looked
+  // right.
+  wheel_left_.pos = (left_ticks - left_ticks_offset_) * wheel_left_.rads_per_count
+    * (cfg_.invert_left ? -1.0 : 1.0);
+  wheel_right_.pos = (right_ticks - right_ticks_offset_) * wheel_right_.rads_per_count
+    * (cfg_.invert_right ? -1.0 : 1.0);
 
   // Velocity = delta position / delta time
   double dt = period.seconds();
@@ -308,14 +335,17 @@ hardware_interface::return_type DiffBotSystemHardware::write(
   if (!comms_.connected())
     return hardware_interface::return_type::ERROR;
 
+  const double left_cmd  = wheel_left_.cmd  * (cfg_.invert_left  ? -1.0 : 1.0);
+  const double right_cmd = wheel_right_.cmd * (cfg_.invert_right ? -1.0 : 1.0);
+
       RCLCPP_INFO_THROTTLE(
     get_logger(), *clock_, 1000,
     "CMD: L=%.2f R=%.2f",
-    wheel_left_.cmd,
-    wheel_right_.cmd
+    left_cmd,
+    right_cmd
   );
 
-  comms_.set_motor_values(wheel_left_.cmd, wheel_right_.cmd);
+  comms_.set_motor_values(left_cmd, right_cmd);
 
   return hardware_interface::return_type::OK;
 }

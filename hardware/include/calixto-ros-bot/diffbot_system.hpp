@@ -37,6 +37,8 @@ class DiffBotSystemHardware : public hardware_interface::SystemInterface
     int baud_rate           = 0;
     int timeout_ms          = 0;
     int enc_counts_per_rev  = 0;
+    bool invert_left        = false;
+    bool invert_right       = false;
   };
 
 public:

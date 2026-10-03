@@ -75,11 +75,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 _LEVEL_NAMES = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
@@ -107,6 +108,15 @@ _rviz_proc = None  # subprocess.Popen, once launched - one-shot, no watchdog
 
 _pose_lock = threading.Lock()
 _latest_pose = {"received": False}
+
+_scan_lock = threading.Lock()
+_latest_scan = {"received": False}
+# Sensor data convention (2026-10-02) - LaserScan publishers (bluesea2
+# included) commonly use BEST_EFFORT reliability; a default RELIABLE
+# subscription wouldn't connect at all (same class of silent QoS/type
+# mismatch hit earlier with cmd_vel_teleop/cmd_vel_remote - topic name
+# alone isn't enough, the whole profile has to be compatible).
+_SCAN_QOS = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
 
 
 def _launch_rviz2():
@@ -148,6 +158,7 @@ class HmiNode(Node):
         self.create_subscription(DiagnosticArray, "/mcu_status", self._on_status, 10)
         self.create_subscription(String, "/hmi/cmd_vel_active_source", self._on_active, _LATCHED_QOS)
         self.create_subscription(Odometry, "/diffbot_base_controller/odom", self._on_odom, 10)
+        self.create_subscription(LaserScan, "/scan", self._on_scan, _SCAN_QOS)
         self._mode_pub = self.create_publisher(String, "/hmi/cmd_vel_mode", _LATCHED_QOS)
         self._goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
         # Plain Twist (2026-10-01), not TwistStamped - twist_mux (the sole
@@ -159,6 +170,11 @@ class HmiNode(Node):
         # produced zero motion despite the mode/topic/subscriber count all
         # looking correct, because of exactly this.
         self._teleop_pub = self.create_publisher(Twist, "/cmd_vel_teleop", 10)
+        # Software-only "EMERGENCY STOP" (2026-10-02) - see twist_mux.yaml's
+        # software_stop entry for exactly what this does and doesn't
+        # guarantee (not a real E-stop - no firmware involved, nothing
+        # happens if ROS2/the network is down).
+        self._estop_pub = self.create_publisher(Twist, "/cmd_vel_estop", 10)
         self.get_logger().info("Subscribed to /mcu_status, /hmi/cmd_vel_active_source, /diffbot_base_controller/odom")
 
     def _on_status(self, msg: DiagnosticArray):
@@ -196,6 +212,28 @@ class HmiNode(Node):
             _latest_pose.clear()
             _latest_pose.update(data)
 
+    def _on_scan(self, msg: LaserScan):
+        # Ranges only, rounded - angle_min/increment let the browser derive
+        # each point's angle itself rather than sending it per-point. inf/nan
+        # (no return) become null so the client can skip them cheaply.
+        ranges = [
+            None if (math.isinf(r) or math.isnan(r)) else round(r, 3)
+            for r in msg.ranges
+        ]
+        data = {
+            "received": True,
+            "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+            "frame_id": msg.header.frame_id or "laser",
+            "angle_min": msg.angle_min,
+            "angle_increment": msg.angle_increment,
+            "range_min": msg.range_min,
+            "range_max": msg.range_max,
+            "ranges": ranges,
+        }
+        with _scan_lock:
+            _latest_scan.clear()
+            _latest_scan.update(data)
+
     def publish_mode(self, mode: str):
         self._mode_pub.publish(String(data=mode))
 
@@ -215,6 +253,14 @@ class HmiNode(Node):
         msg.linear.x = linear
         msg.angular.z = angular
         self._teleop_pub.publish(msg)
+
+    def publish_estop(self):
+        # Always zero - this is a stop button, not a drive command. The
+        # client resends this repeatedly while engaged (see /estop below);
+        # it must stop resending to actually release, same as remote_ros_node
+        # not publishing while idle - twist_mux keeps blocking lower-priority
+        # sources for as long as fresh messages keep arriving here.
+        self._estop_pub.publish(Twist())
 
 
 HTML_PAGE = """<!doctype html>
@@ -295,6 +341,13 @@ HTML_PAGE = """<!doctype html>
   }
   button:hover { background: #eceef1; }
   button.active { border-color: #2f6fed; color: #2f6fed; background: #eaf1fe; }
+  .estop-btn {
+    width: 100%; padding: 0.9rem; font-size: 1.1rem; font-weight: 700; letter-spacing: 0.03em;
+    border-radius: 10px; border: 2px solid #b91c1c; background: #dc2626; color: #fff;
+  }
+  .estop-btn:hover { background: #c81e1e; }
+  .estop-btn.engaged { background: #7f1d1d; border-color: #fff; animation: estop-pulse 1s infinite; }
+  @keyframes estop-pulse { 50% { opacity: 0.75; } }
   .hint { font-size: 0.78rem; color: #6b7280; margin-top: 0.4rem; line-height: 1.4; }
   .mode-panel {
     margin-top: 0.6rem; padding: 0.7rem 0.8rem; border-radius: 8px; font-size: 0.85rem;
@@ -331,6 +384,12 @@ HTML_PAGE = """<!doctype html>
     </main>
 
     <aside class="sidebar">
+      <button id="estop-btn" class="estop-btn">EMERGENCY STOP</button>
+      <div class="hint">Software-only - commands zero velocity at the highest priority over
+      ROS2, but does NOT de-energize the motors (unlike the physical E-stops - wheels still
+      resist being pushed by hand) and does nothing if the network/ROS2 stack is down. Use the
+      physical E-stop buttons for anything safety-critical.</div>
+
       <h2>AMR Status</h2>
       <div id="amr-status" class="amr-status-box unknown">No data yet</div>
       <div id="conn" class="hint">connecting...</div>
@@ -376,6 +435,34 @@ const amrStatusEl = document.getElementById('amr-status');
 const modeButtons = document.querySelectorAll('button[data-mode]');
 const modePanelEl = document.getElementById('mode-panel');
 const rviz2Btn = document.getElementById('rviz2-btn');
+
+// Software-only "EMERGENCY STOP" (2026-10-02) - see this button's own hint
+// text in the HTML and twist_mux.yaml's software_stop entry for exactly
+// what this does and doesn't guarantee. While engaged, keeps resending a
+// zero-velocity command faster than twist_mux's 0.5s timeout so it keeps
+// blocking every lower-priority source (teleop/remote/nav); stopping the
+// resend on release is what lets twist_mux fall through to them again -
+// same mechanism as remote_ros_node.py not publishing while idle.
+const estopBtn = document.getElementById('estop-btn');
+let estopEngaged = false;
+let estopInterval = null;
+
+function sendEstop() {
+  fetch('/estop', { method: 'POST' }).catch(() => {});
+}
+
+estopBtn.addEventListener('click', () => {
+  estopEngaged = !estopEngaged;
+  estopBtn.classList.toggle('engaged', estopEngaged);
+  estopBtn.textContent = estopEngaged ? 'STOP ENGAGED - CLICK TO RELEASE' : 'EMERGENCY STOP';
+  if (estopEngaged) {
+    sendEstop();
+    estopInterval = setInterval(sendEstop, 150);
+  } else {
+    clearInterval(estopInterval);
+    estopInterval = null;
+  }
+});
 
 rviz2Btn.addEventListener('click', async () => {
   const prevText = rviz2Btn.textContent;
@@ -613,6 +700,7 @@ const canvas = document.getElementById('map-canvas');
 const ctx = canvas.getContext('2d');
 const recenterBtn = document.getElementById('recenter-btn');
 let latestPose = null;   // {x, y, theta} in odom frame
+let latestScan = null;   // {angle_min, angle_increment, ranges[]} in the laser's own frame
 let trail = [];          // recent [x, y] breadcrumb points
 let drag = null;         // {startPx, startPy, curPx, curPy} while left-dragging a goal
 let panLast = null;      // {px, py} last pointer position while right-dragging to pan
@@ -674,6 +762,27 @@ function draw() {
     for (const [tx, ty] of trail) {
       const [px, py] = worldToPx(tx, ty);
       ctx.beginPath(); ctx.arc(px, py, 2 * devicePixelRatio, 0, 7); ctx.fill();
+    }
+
+    // LiDAR scan points, transformed into the world frame using the robot's
+    // CURRENT pose (scan and pose arrive on separate polls, so this is a
+    // "latest of each" overlay, not a timestamp-matched one - fine for a
+    // bring-up sanity check, not a substitute for a real TF chain). Assumes
+    // the laser's own 0deg points along the robot's forward +x - true until
+    // an actual mount offset/static transform is set up.
+    if (latestScan && latestScan.ranges) {
+      ctx.fillStyle = 'rgba(224, 70, 50, 0.65)';
+      const a0 = latestScan.angle_min, da = latestScan.angle_increment;
+      const rmin = latestScan.range_min, rmax = latestScan.range_max;
+      for (let i = 0; i < latestScan.ranges.length; i++) {
+        const r = latestScan.ranges[i];
+        if (r === null || r < rmin || r > rmax) continue;
+        const angle = latestPose.theta + a0 + i * da;
+        const wx = latestPose.x + r * Math.cos(angle);
+        const wy = latestPose.y + r * Math.sin(angle);
+        const [px, py] = worldToPx(wx, wy);
+        ctx.beginPath(); ctx.arc(px, py, 1.5 * devicePixelRatio, 0, 7); ctx.fill();
+      }
     }
 
     // Robot arrow at its actual world position; rotated by heading (canvas
@@ -888,12 +997,24 @@ async function pollPose() {
   }
 }
 
+async function pollScan() {
+  try {
+    const res = await fetch('/scan.json', { cache: 'no-store' });
+    const data = await res.json();
+    latestScan = data.received ? data : null;
+  } catch (e) {
+    latestScan = null;
+  }
+}
+
 pollStatus();
 pollActive();
 pollPose();
+pollScan();
 setInterval(pollStatus, 500);
 setInterval(pollActive, 500);
 setInterval(pollPose, 150);
+setInterval(pollScan, 200);
 </script>
 </body>
 </html>
@@ -925,6 +1046,10 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
         elif self.path == "/pose.json":
             with _pose_lock:
                 data = dict(_latest_pose)
+            self._send_json(data)
+        elif self.path == "/scan.json":
+            with _scan_lock:
+                data = dict(_latest_scan)
             self._send_json(data)
         elif self.path in ("/", "/index.html"):
             body = HTML_PAGE.encode("utf-8")
@@ -965,6 +1090,9 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "error", "detail": f"bad teleop payload: {e}"}, status=400)
                 return
             self.server.hmi_node.publish_teleop(linear, angular)
+            self._send_json({"status": "ok"})
+        elif self.path == "/estop":
+            self.server.hmi_node.publish_estop()
             self._send_json({"status": "ok"})
         elif self.path == "/launch_rviz2":
             self._send_json(_launch_rviz2())

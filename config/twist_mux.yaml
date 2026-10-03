@@ -13,3 +13,18 @@ twist_mux:
         topic: cmd_vel_remote
         timeout: 0.5
         priority: 150
+      software_stop:
+        # Web UI "EMERGENCY STOP" button (2026-10-02) - deliberately NOT a
+        # real E-stop: it only commands zero velocity over ROS2/twist_mux,
+        # same as every other source here. It does not de-energize the
+        # motors (wheels still resist being pushed by hand, unlike the
+        # physical E-stops) and does nothing if the ROS2 stack or network
+        # link is down - the opposite of what a real E-stop guarantees. A
+        # true E-stop equivalent needs a firmware change (the control_flags
+        # EMERGENCY_BRAKE bit is already defined in the wire protocol but
+        # the firmware currently ignores it - deliberately deferred, see
+        # that project's own CLAUDE.md gaps). Highest priority here so it
+        # overrides even the physical remote while engaged.
+        topic: cmd_vel_estop
+        timeout: 0.5
+        priority: 200

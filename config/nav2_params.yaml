@@ -1,6 +1,6 @@
 amcl:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     alpha1: 0.2
     alpha2: 0.2
     alpha3: 0.2
@@ -37,11 +37,11 @@ amcl:
     z_max: 0.05
     z_rand: 0.5
     z_short: 0.05
-    scan_topic: scan
+    scan_topic: /scan_filtered
 
 bt_navigator:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odometry/filtered
@@ -100,16 +100,15 @@ bt_navigator:
 
 bt_navigator_navigate_through_poses_rclcpp_node:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
 
 bt_navigator_navigate_to_pose_rclcpp_node:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
 
 controller_server:
   ros__parameters:
-    use_sim_time: True
-    enable_stamped_cmd_vel: true
+    use_sim_time: False
     controller_frequency: 20.0
     # CHANGED: was 0.001 / 0.5 / 0.001 — y-threshold corrected for diff drive
     min_x_velocity_threshold: 0.001
@@ -123,7 +122,17 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # 2026-10-07: was 10.0 - too tight for a near-180 degree in-place turn.
+      # SimpleProgressChecker measures XY position change, which barely moves
+      # during in-place rotation, and a direct-motor test (bypassing ROS)
+      # found the right wheel delivers ~20% less distance in reverse than
+      # forward for the same command - a real, repeatable, wheel-specific
+      # weakness (not a planner/speed issue - see FollowPath's rotate_to_*
+      # comment below). A goal behind the robot needs a long, slow, mostly
+      # rotational turn before any translation starts, and was very likely
+      # hitting this time allowance and getting declared "stuck" before it
+      # ever had a chance to finish turning.
+      movement_time_allowance: 25.0
 
     general_goal_checker:
       stateful: True
@@ -138,8 +147,23 @@ controller_server:
       angular_dist_threshold: 0.785          # engage shim above ~45 deg
       # angular_disengage_threshold: 1.2     # UNCOMMENT if on Nav2 Iron or later (adds hysteresis)
       forward_sampling_distance: 1.0         # was 0.5 — longer lookahead = stable heading target
-      rotate_to_heading_angular_vel: 1.6     # was 1.8 — less overshoot of threshold
-      max_angular_accel: 1.5
+      # 2026-10-07: were 1.6 / 1.5 - lowered after a direct-motor test (bypassing
+      # ROS, same ramp/hold profile as this controller) found the right wheel
+      # only delivers ~80% of the left wheel's distance when spinning in
+      # reverse for the same commanded velocity, for this robot's whole
+      # lifetime so far (not new damage). A lower absolute speed/accel target
+      # gives that wheel's closed-loop controller an easier, more trackable
+      # setpoint, instead of commanding a fast turn that one wheel physically
+      # can't keep up with - which read as "struggling" rather than a clean
+      # failure. Revisit this gap directly (drive current/torque tuning on
+      # that wheel's reverse direction) rather than raising these back up.
+      # 2026-10-07 (later): raised from 1.0/1.0 to 1.3/1.3 and max_vel_theta
+      # 0.6 -> 0.9 on request - turning was too slow in practice. Deliberately
+      # kept under the 1.6/1.5 backed out above, so the weak wheel still has
+      # margin. The reverse-direction gap itself is still unfixed; if turns
+      # start reading as "struggling" again, this is the first thing to undo.
+      rotate_to_heading_angular_vel: 1.3
+      max_angular_accel: 1.3
       simulate_ahead_time: 1.0
 
       # ----- DWB primary controller -----
@@ -148,16 +172,16 @@ controller_server:
       min_vel_y: 0.0
       max_vel_x: 0.15
       max_vel_y: 0.0
-      max_vel_theta: 1.75
+      max_vel_theta: 0.9
       min_speed_xy: 0.0
       max_speed_xy: 0.15
-      min_speed_theta: 0.001                 # was 0.4 — that value broke stopped-detection
+      min_speed_theta: 0.001  # linear capped at 0.15 m/s, angular at 0.9 rad/s                 # was 0.4 — that value broke stopped-detection
       acc_lim_x: 1.0
       acc_lim_y: 0.0
-      acc_lim_theta: 1.5
+      acc_lim_theta: 1.3
       decel_lim_x: -1.0
       decel_lim_y: 0.0
-      decel_lim_theta: -1.5
+      decel_lim_theta: -1.0
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 20
@@ -188,12 +212,12 @@ local_costmap:
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
-      use_sim_time: True
+      use_sim_time: False
       rolling_window: true
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.22
+      footprint: "[[0.39, 0.24], [0.39, -0.24], [-0.39, -0.24], [-0.39, 0.24]]"
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
@@ -210,7 +234,7 @@ local_costmap:
         mark_threshold: 0
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -231,8 +255,8 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      use_sim_time: True
-      robot_radius: 0.22
+      use_sim_time: False
+      footprint: "[[0.39, 0.24], [0.39, -0.24], [-0.39, -0.24], [-0.39, 0.24]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -241,7 +265,7 @@ global_costmap:
         enabled: True
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -261,12 +285,12 @@ global_costmap:
 
 map_server:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     yaml_filename: ""
 
 map_saver:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     save_map_timeout: 5.0
     free_thresh_default: 0.25
     occupied_thresh_default: 0.65
@@ -275,7 +299,7 @@ map_saver:
 #planner_server:
 #  ros__parameters:
 #    expected_planner_frequency: 5.0         # was 20.0 — slower replans = stable lookahead
-#    use_sim_time: True
+#    use_sim_time: False
 #    planner_plugins: ["GridBased"]
 #    GridBased:
 #      plugin: "nav2_navfn_planner/NavfnPlanner"
@@ -286,7 +310,7 @@ map_saver:
 planner_server:
   ros__parameters:
     expected_planner_frequency: 20.0
-    use_sim_time: True
+    use_sim_time: False
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_smac_planner/SmacPlanner2D" # Changed from Navfn
@@ -302,7 +326,7 @@ planner_server:
 
 smoother_server:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     smoother_plugins: ["simple_smoother"]
     simple_smoother:
       plugin: "nav2_smoother::SimpleSmoother"
@@ -329,7 +353,16 @@ behavior_server:
     global_frame: odom
     robot_base_frame: base_link
     transform_tolerance: 1.0
-    use_sim_time: true
+    # 2026-10-07: was left "true" when every other use_sim_time in this file
+    # was switched to false - nothing on this robot publishes /clock, so with
+    # this set, behavior_server's node clock never advances at all. Recovery
+    # behaviors (Spin, BackUp, ...) time themselves against that clock, so
+    # one would start ("Running spin" in the log) and then hang forever,
+    # never completing or timing out - confirmed live: a goal that failed to
+    # plan triggered a Spin recovery that got permanently stuck exactly like
+    # this, with zero further behavior_server log output and zero cmd_vel
+    # traffic, requiring a nav2 restart to recover.
+    use_sim_time: false
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
     min_rotational_vel: 0.4
@@ -337,11 +370,11 @@ behavior_server:
 
 robot_state_publisher:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
 
 waypoint_follower:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     loop_rate: 20
     stop_on_failure: false
     waypoint_task_executor_plugin: "wait_at_waypoint"
@@ -352,7 +385,7 @@ waypoint_follower:
 
 velocity_smoother:
   ros__parameters:
-    use_sim_time: True
+    use_sim_time: False
     enable_stamped_cmd_vel: true
     smoothing_frequency: 20.0
     scale_velocities: False

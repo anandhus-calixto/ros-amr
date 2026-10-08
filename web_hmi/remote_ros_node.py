@@ -39,7 +39,8 @@ import serial
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, TwistStamped
+from geometry_msgs.msg import Twist, TwistStamped, Vector3
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 
 DEFAULT_REMOTE_DEVICE = None  # None = auto-detect the first /dev/ttyUSB*
 DEFAULT_REMOTE_BAUD = 115200
@@ -164,7 +165,16 @@ class RemoteCmdVelPublisher(Node):
         # (confirmed on hardware with the identical /cmd_vel_teleop bug -
         # see status_web_server.py's publish_teleop for the same fix).
         self._pub = self.create_publisher(Twist, "/cmd_vel_remote", 10)
+        # Speed limits set on the web HMI, shared with keyboard/joystick teleop.
+        # Latched so a remote started after the HMI still gets the current value.
+        latched = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Vector3, "/hmi/teleop_speed", self._on_speed, latched)
         self.create_timer(1.0 / rate, self._tick)
+
+    def _on_speed(self, msg: Vector3):
+        self._reader.linear_speed = msg.x
+        self._reader.angular_speed = msg.y
+        self.get_logger().info(f"speed limits from web HMI: linear={msg.x:.2f} m/s angular={msg.y:.2f} rad/s")
 
     def _tick(self):
         label, linear, angular, last_frame_time = self._reader.snapshot()

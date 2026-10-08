@@ -45,15 +45,6 @@ There's no LIDAR or map yet, so the canvas only draws a grid + the live pose
 add nav_msgs/OccupancyGrid and sensor_msgs/LaserScan subscriptions to
 HmiNode + matching canvas draw layers once a LIDAR is integrated.
 
-"Open RViz2" button (2026-10-01): spawns a plain native RViz2 window on
-THIS MACHINE's own screen (wherever this server process is running) - not
-embedded in the page, no VNC, none of the earlier self-healing-watchdog
-complexity. One-shot: click launches it if it's not already running: if you
-close the window yourself, that's it, nothing relaunches it - click the
-button again if you want it back. Only meaningful when this server runs on
-a machine with a display attached; opening the HMI from a phone or another
-computer on the network still only opens RViz2 on the HOST machine's screen.
-
 Usage:
     source /opt/ros/humble/setup.bash
     source <workspace>/install/setup.bash   # for message bindings
@@ -64,47 +55,116 @@ Usage:
     pose, and alongside cmd_vel_mux.py for mode selection to have any effect.
 """
 import argparse
+import base64
 import json
 import math
 import os
 import subprocess
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.time import Time
+from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, LookupException, TransformListener
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-from ament_index_python.packages import get_package_share_directory
 from diagnostic_msgs.msg import DiagnosticArray
-from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped, Vector3
+from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 _LEVEL_NAMES = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
 _VALID_MODES = {"none", "teleop"}  # the only two states the page itself can toggle - see setMode()'s comment
 _LATCHED_QOS = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+_MAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps")
 
-# Snap-package environment pollution fix (see the RViz2 "undefined symbol:
-# __libc_pthread_init" crash this project hit before): VS Code, itself
-# installed as a Snap, leaks these vars into child GUI processes launched
-# from its integrated terminal. Strip them before spawning rviz2, since this
-# server may itself be running from that same polluted shell.
-_SNAP_POLLUTED_VARS = (
-    "LOCPATH", "GTK_PATH", "GTK_EXE_PREFIX", "GIO_MODULE_DIR",
-    "GTK_IM_MODULE_FILE", "GSETTINGS_SCHEMA_DIR", "XDG_DATA_DIRS",
-)
+
+def _valid_map_name(name: str) -> bool:
+    return bool(name) and len(name) <= 40 and name.replace("_", "").replace("-", "").isalnum()
+
+
+def _list_maps():
+    if not os.path.isdir(_MAPS_DIR):
+        return []
+    return sorted(f[:-5] for f in os.listdir(_MAPS_DIR) if f.endswith(".yaml"))
+
+
+def _save_map(payload: dict) -> str:
+    """Writes an edited map as a standard map_server pair (YAML + binary PGM).
+    Refuses to overwrite an existing map name."""
+    name = payload["name"]
+    if not _valid_map_name(name):
+        raise ValueError("map name: letters, digits, _ and - only")
+    w, h = int(payload["width"]), int(payload["height"])
+    data = base64.b64decode(payload["data"])
+    if len(data) != w * h:
+        raise ValueError("pixel data does not match width x height")
+    if os.path.exists(os.path.join(_MAPS_DIR, name + ".yaml")):
+        raise FileExistsError(f"map '{name}' already exists - choose another name")
+    os.makedirs(_MAPS_DIR, exist_ok=True)
+    resolution = float(payload["resolution"])
+    ox, oy = (float(v) for v in payload["origin"][:2])
+    with open(os.path.join(_MAPS_DIR, name + ".pgm"), "wb") as f:
+        f.write(f"P5\n{w} {h}\n255\n".encode("ascii") + data)
+    with open(os.path.join(_MAPS_DIR, name + ".yaml"), "w") as f:
+        f.write(
+            f"image: {name}.pgm\nmode: trinary\nresolution: {resolution}\n"
+            f"origin: [{ox}, {oy}, 0.0]\nnegate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n"
+        )
+    return name
+
+
+def _load_map(name: str) -> dict:
+    """Reads a saved map (ROS map_server YAML + binary P5 PGM) for the web UI."""
+    with open(os.path.join(_MAPS_DIR, name + ".yaml")) as f:
+        meta = {}
+        for line in f:
+            if ":" in line and not line.lstrip().startswith("#"):
+                key, value = line.split(":", 1)
+                meta[key.strip()] = value.strip()
+    resolution = float(meta["resolution"])
+    origin = [float(v) for v in meta["origin"].strip("[]").split(",")]
+
+    with open(os.path.join(_MAPS_DIR, name + ".pgm"), "rb") as f:
+        raw = f.read()
+    tokens, pos = [], 0
+    while len(tokens) < 4:
+        while raw[pos:pos + 1].isspace():
+            pos += 1
+        if raw[pos:pos + 1] == b"#":
+            pos = raw.index(b"\n", pos) + 1
+            continue
+        start = pos
+        while not raw[pos:pos + 1].isspace():
+            pos += 1
+        tokens.append(raw[start:pos])
+    pos += 1  # single whitespace after maxval
+    magic, width, height, _maxval = tokens
+    if magic != b"P5":
+        raise ValueError("not a binary PGM map")
+    width, height = int(width), int(height)
+    data = raw[pos:pos + width * height]
+    if len(data) != width * height:
+        raise ValueError("map file is shorter than its header says")
+    return {
+        "name": name,
+        "width": width,
+        "height": height,
+        "resolution": resolution,
+        "origin": origin,
+        "data": base64.b64encode(data).decode("ascii"),
+    }
 
 _status_lock = threading.Lock()
 _latest_status = {"received": False}
 
 _active_lock = threading.Lock()
 _latest_active = {"received": False}
-
-_rviz_lock = threading.Lock()
-_rviz_proc = None  # subprocess.Popen, once launched - one-shot, no watchdog
 
 _pose_lock = threading.Lock()
 _latest_pose = {"received": False}
@@ -117,27 +177,8 @@ _latest_scan = {"received": False}
 # mismatch hit earlier with cmd_vel_teleop/cmd_vel_remote - topic name
 # alone isn't enough, the whole profile has to be compatible).
 _SCAN_QOS = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-
-
-def _launch_rviz2():
-    """One-shot: spawn a native RViz2 window on this machine's own display
-    if one isn't already running. No watchdog, no auto-relaunch - closing
-    the window is just closing it (see this file's docstring for why that
-    matters: an earlier version fought the user over this)."""
-    global _rviz_proc
-    with _rviz_lock:
-        if _rviz_proc is not None and _rviz_proc.poll() is None:
-            return {"status": "already_running", "detail": "RViz2 is already open on this machine."}
-        try:
-            rviz_config = os.path.join(
-                get_package_share_directory("calixto-ros-bot"), "description", "rviz", "rviz_config.rviz"
-            )
-            env = {k: v for k, v in os.environ.items() if k not in _SNAP_POLLUTED_VARS}
-            _rviz_proc = subprocess.Popen(["rviz2", "-d", rviz_config], env=env,
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return {"status": "launched", "detail": "RViz2 opening on this machine's screen."}
-        except Exception as e:
-            return {"status": "error", "detail": f"Failed to launch rviz2: {e}"}
+_live_map_lock = threading.Lock()
+_latest_live_map = None  # latest /map from SLAM, already in PGM pixel values, rows top-first
 
 
 def _level_to_int(level) -> int:
@@ -158,9 +199,13 @@ class HmiNode(Node):
         self.create_subscription(DiagnosticArray, "/mcu_status", self._on_status, 10)
         self.create_subscription(String, "/hmi/cmd_vel_active_source", self._on_active, _LATCHED_QOS)
         self.create_subscription(Odometry, "/diffbot_base_controller/odom", self._on_odom, 10)
-        self.create_subscription(LaserScan, "/scan", self._on_scan, _SCAN_QOS)
+        self.create_subscription(LaserScan, "/scan_filtered", self._on_scan, _SCAN_QOS)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self.create_subscription(OccupancyGrid, "/map", self._on_map, 1)
         self._mode_pub = self.create_publisher(String, "/hmi/cmd_vel_mode", _LATCHED_QOS)
         self._goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
+        self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
         # Plain Twist (2026-10-01), not TwistStamped - twist_mux (the sole
         # subscriber on this topic) only supports plain geometry_msgs/Twist
         # inputs in the installed version (4.3.0), no stamped variant. A
@@ -170,11 +215,20 @@ class HmiNode(Node):
         # produced zero motion despite the mode/topic/subscriber count all
         # looking correct, because of exactly this.
         self._teleop_pub = self.create_publisher(Twist, "/cmd_vel_teleop", 10)
+        self._teleop_lock = threading.Lock()
+        self._teleop_session = None
+        self._teleop_seq = -1
         # Software-only "EMERGENCY STOP" (2026-10-02) - see twist_mux.yaml's
         # software_stop entry for exactly what this does and doesn't
         # guarantee (not a real E-stop - no firmware involved, nothing
         # happens if ROS2/the network is down).
         self._estop_pub = self.create_publisher(Twist, "/cmd_vel_estop", 10)
+        # Shared speed limits for keyboard/joystick (this page) and the RF
+        # remote (remote_ros_node.py subscribes to this topic). x = max linear
+        # m/s, y = max angular rad/s.
+        self._speed_pub = self.create_publisher(Vector3, "/hmi/teleop_speed", _LATCHED_QOS)
+        self.speed_limits = (0.5, 1.0)
+        self.publish_speed(*self.speed_limits)
         self.get_logger().info("Subscribed to /mcu_status, /hmi/cmd_vel_active_source, /diffbot_base_controller/odom")
 
     def _on_status(self, msg: DiagnosticArray):
@@ -212,6 +266,21 @@ class HmiNode(Node):
             _latest_pose.clear()
             _latest_pose.update(data)
 
+    def get_map_to_odom(self):
+        """The correction AMCL produces once localized - None before that. Composed
+        onto the odom-frame pose (see pollPose() in the page) so the robot, its
+        outline, and the scan all draw aligned with the saved map's own frame."""
+        try:
+            t = self._tf_buffer.lookup_transform("map", "odom", Time())
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+        q = t.transform.rotation
+        return {
+            "x": t.transform.translation.x,
+            "y": t.transform.translation.y,
+            "theta": 2.0 * math.atan2(q.z, q.w),
+        }
+
     def _on_scan(self, msg: LaserScan):
         # Ranges only, rounded - angle_min/increment let the browser derive
         # each point's angle itself rather than sending it per-point. inf/nan
@@ -237,10 +306,46 @@ class HmiNode(Node):
     def publish_mode(self, mode: str):
         self._mode_pub.publish(String(data=mode))
 
+    def _on_map(self, msg: OccupancyGrid):
+        global _latest_live_map
+        w, h = msg.info.width, msg.info.height
+        rows = []
+        for r in reversed(range(h)):  # OccupancyGrid row 0 is the bottom; PGM row 0 is the top
+            row = msg.data[r * w:(r + 1) * w]
+            rows.append(bytes(205 if v < 0 else (0 if v >= 65 else 254) for v in row))
+        with _live_map_lock:
+            _latest_live_map = {
+                "width": w, "height": h, "resolution": msg.info.resolution,
+                "origin": [msg.info.origin.position.x, msg.info.origin.position.y, 0.0],
+                "data": b"".join(rows),
+            }
+
+    def publish_speed(self, linear: float, angular: float):
+        linear = min(max(linear, 0.1), 1.0)
+        angular = min(max(angular, 0.2), 2.0)
+        self.speed_limits = (linear, angular)
+        self._speed_pub.publish(Vector3(x=linear, y=angular))
+        return self.speed_limits
+
+    def publish_initial_pose(self, x: float, y: float, theta: float):
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(theta / 2.0)
+        msg.pose.pose.orientation.w = math.cos(theta / 2.0)
+        # Same defaults RViz's "2D Pose Estimate" tool uses.
+        msg.pose.covariance[0] = 0.25
+        msg.pose.covariance[7] = 0.25
+        msg.pose.covariance[35] = 0.06853891945200942
+        self._initial_pose_pub.publish(msg)
+        self.get_logger().info(f"Published /initialpose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
+
     def publish_goal(self, x: float, y: float, theta: float):
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "odom"  # no map/localization yet - see this file's docstring
+        msg.header.frame_id = "map"  # the canvas's x,y are map-frame once AMCL is localized (see pollPose)
         msg.pose.position.x = x
         msg.pose.position.y = y
         msg.pose.orientation.z = math.sin(theta / 2.0)
@@ -248,11 +353,24 @@ class HmiNode(Node):
         self._goal_pub.publish(msg)
         self.get_logger().info(f"Published /goal_pose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
 
-    def publish_teleop(self, linear: float, angular: float):
-        msg = Twist()
-        msg.linear.x = linear
-        msg.angular.z = angular
-        self._teleop_pub.publish(msg)
+    def publish_teleop(self, linear: float, angular: float, session=None, seq=None):
+        # Commands from the browser carry a per-page session id and an
+        # increasing sequence number. Over a laggy link, older motion commands
+        # can arrive after a newer stop; dropping anything older than the newest
+        # accepted command stops that from restarting motion.
+        with self._teleop_lock:
+            if session is not None and seq is not None:
+                if session != self._teleop_session:
+                    self._teleop_session = session
+                    self._teleop_seq = -1
+                if seq <= self._teleop_seq:
+                    return False
+                self._teleop_seq = seq
+            msg = Twist()
+            msg.linear.x = linear
+            msg.angular.z = angular
+            self._teleop_pub.publish(msg)
+            return True
 
     def publish_estop(self):
         # Always zero - this is a stop button, not a drive command. The
@@ -283,7 +401,13 @@ HTML_PAGE = """<!doctype html>
     padding: 0.6rem 1rem; border-bottom: 1px solid #dfe2e7; flex: 0 0 auto; background: #ffffff;
   }
   header.topbar h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
-  .badges { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .badges { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .battery { position: relative; width: 96px; height: 24px; border: 2px solid #5a5f66; border-radius: 4px; background: #ffffff; overflow: hidden; }
+  .battery::after { content: ''; position: absolute; right: -6px; top: 6px; width: 4px; height: 8px; background: #5a5f66; border-radius: 0 2px 2px 0; }
+  .battery-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #2e9d4f; transition: width 0.6s, background 0.6s; }
+  .battery.low .battery-fill { background: #e0a030; }
+  .battery.critical .battery-fill { background: #d64541; }
+  .battery-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 600; color: #1d2026; mix-blend-mode: difference; }
   .badge {
     padding: 0.35rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
     display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap;
@@ -353,6 +477,24 @@ HTML_PAGE = """<!doctype html>
     margin-top: 0.6rem; padding: 0.7rem 0.8rem; border-radius: 8px; font-size: 0.85rem;
     background: #f7f8fa; border: 1px solid #eceef1; line-height: 1.5;
   }
+  .modal { position: fixed; inset: 0; background: rgba(20, 22, 26, 0.45); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal[hidden] { display: none; }
+  .modal-box { background: #ffffff; border-radius: 8px; padding: 1rem; min-width: 320px; max-width: 90vw; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+  .topleft-panel { position: absolute; top: 10px; left: 10px; z-index: 5; width: 240px; background: rgba(255,255,255,0.95); padding: 8px; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.15); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 0.75rem; }
+  .tab { flex: 1; padding: 0.4rem 0.3rem; }
+  .tab.active { background: #2f6fed; color: #ffffff; border-color: #2f6fed; }
+  .tabpanel[hidden] { display: none; }
+  .editor-box { width: min(900px, 92vw); }
+  .editor-tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 0.5rem; }
+  .etool.active { background: #2f6fed; color: #ffffff; border-color: #2f6fed; }
+  #nav-pose-mode-btn.active { background: #2f6fed; color: #ffffff; border-color: #2f6fed; }
+  #editor-canvas { display: block; width: min(720px, 80vw); height: 480px; border: 1px solid #d8dbe0; cursor: crosshair; touch-action: none; }
+  .editor-save { display: flex; gap: 8px; align-items: center; margin-top: 0.5rem; }
+  .logo { height: 44px; margin-right: 12px; vertical-align: middle; }
+  .speedctl label { display: block; margin: 0.4rem 0; }
+  .speedctl input[type=range] { width: 60%; vertical-align: middle; }
   .keygrid {
     display: grid; grid-template-columns: repeat(3, 2.6rem); gap: 0.3rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1rem;
@@ -366,16 +508,24 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
   <header class="topbar">
-    <h1>Calixto AMR</h1>
+    <img class="logo" src="/assets/calixto-systems-logo.png" alt="Calixto Systems">
+    <h1>Autonomous Mobile Robot</h1>
     <div class="badges">
-      <button id="rviz2-btn" title="Opens a native RViz2 window on the machine running this server - not this browser">Open RViz2</button>
-      <span id="active-badge" class="badge unknown">Source: unknown</span>
+      <div id="battery" class="battery" title="Battery (placeholder values until the BMS is connected)">
+        <div class="battery-fill"></div><span class="battery-pct">--%</span>
+      </div>
       <span id="pose-badge" class="badge unknown">Pose: unknown</span>
     </div>
   </header>
 
   <div class="layout">
     <main class="map-main">
+      <div class="topleft-panel">
+        <button id="estop-btn" class="estop-btn">EMERGENCY STOP</button>
+        <div class="hint">Software stop only - does not cut motor power.</div>
+        <div id="amr-status" class="amr-status-box unknown">No data yet</div>
+        <div id="conn" class="hint">connecting...</div>
+      </div>
       <canvas id="map-canvas"></canvas>
       <div class="map-hint">Mouse: left-drag sets goal, right-drag pans, scroll zooms &middot;
       Touch: drag pans, pinch zooms, long-press-then-drag sets a goal</div>
@@ -384,57 +534,400 @@ HTML_PAGE = """<!doctype html>
     </main>
 
     <aside class="sidebar">
-      <button id="estop-btn" class="estop-btn">EMERGENCY STOP</button>
-      <div class="hint">Software-only - commands zero velocity at the highest priority over
-      ROS2, but does NOT de-energize the motors (unlike the physical E-stops - wheels still
-      resist being pushed by hand) and does nothing if the network/ROS2 stack is down. Use the
-      physical E-stop buttons for anything safety-critical.</div>
-
-      <h2>AMR Status</h2>
-      <div id="amr-status" class="amr-status-box unknown">No data yet</div>
-      <div id="conn" class="hint">connecting...</div>
-
-      <h2>Drive mode</h2>
-      <div class="hint">Priority is fixed, not selectable: the RF remote always wins when it's
-      actively being used, then this page's keyboard/joystick, then navigation goals - whichever
-      of those is actually sending a command drives the robot. The only thing to toggle here is
-      whether <em>this browser tab's</em> keyboard/joystick is live.</div>
-      <div class="modes">
-        <button data-mode="teleop">Keyboard control: OFF</button>
-      </div>
-      <div id="mode-panel" class="mode-panel"></div>
-
-      <h2>RF remote</h2>
-      <div class="mode-panel">
-        <strong>Button mapping</strong> (always active, highest priority - no toggle needed):
-        <table class="remote-map"><tbody>
-          <tr><td>Top</td><td>Drive forward</td></tr>
-          <tr><td>Down</td><td>Drive backward</td></tr>
-          <tr><td>Left</td><td>Pivot left (CCW)</td></tr>
-          <tr><td>Right</td><td>Pivot right (CW)</td></tr>
-          <tr><td>Centre</td><td>Stop</td></tr>
-        </tbody></table>
-        <div class="hint">Run alongside: <code>python3 web_hmi/remote_ros_node.py</code>. Stops
-        automatically if the remote goes silent for &gt;1.5s.</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="control">Speed &amp; control</button>
+        <button class="tab" data-tab="mapping">Mapping</button>
+        <button class="tab" data-tab="navigation">Navigation</button>
       </div>
 
-      <h2>Navigation</h2>
-      <div class="mode-panel">
-        Nav2 isn't running on the real robot yet (needs LIDAR integration first), but goal-setting
-        is already wired up and always active: click and drag on the map to the left to publish a
-        goal on /goal_pose (drag direction sets heading). It just has nothing listening yet.
-      </div>
+      <section class="tabpanel" data-panel="control">
+        <div class="speedctl">
+          <label>Max linear speed <input type="range" id="teleop-lin" min="0.1" max="1.0" step="0.05"> <span id="teleop-lin-val"></span> m/s
+            <span class="hint" id="teleop-lin-rpm"></span></label>
+          <label>Max angular speed <input type="range" id="teleop-ang" min="0.2" max="2.0" step="0.1"> <span id="teleop-ang-val"></span> rad/s</label>
+          <div class="hint">Applies to keyboard, joystick and RF remote.</div>
+        </div>
+        <h2>Keyboard input</h2>
+        <div class="modes">
+          <button data-mode="teleop">Keyboard control: OFF</button>
+        </div>
+        <div id="mode-panel" class="mode-panel"></div>
+        <div class="hint">RF remote: always active, highest priority.</div>
+      </section>
+
+      <section class="tabpanel" data-panel="mapping" hidden>
+        <div class="speedctl">
+          <label>Map name <input type="text" id="map-name" placeholder="e.g. lab_1" style="width:60%"></label>
+          <div class="modes">
+            <button onclick="mapping('start')">Start mapping</button>
+            <button onclick="mapping('stop')">Save &amp; stop</button>
+            <button onclick="mapping('discard')">Stop without saving</button>
+          </div>
+          <label>Show saved map <select id="map-select"><option value="">none</option></select></label>
+          <div class="modes">
+            <button id="map-edit-btn">Edit map</button>
+          </div>
+          <div id="map-status" class="hint"></div>
+        </div>
+      </section>
+
+      <section class="tabpanel" data-panel="navigation" hidden>
+        <div class="speedctl">
+          <label>Map for navigation <select id="nav-map-select"><option value="">none</option></select></label>
+          <div class="modes">
+            <button id="nav-start-btn">Start navigation</button>
+            <button id="nav-stop-btn">Stop navigation</button>
+          </div>
+          <div class="modes">
+            <button id="nav-pose-mode-btn">Set initial pose</button>
+          </div>
+          <div class="hint">Click and drag on the map to set a goal. Drag direction sets heading.
+          While "Set initial pose" is on, the next drag sets the robot's starting pose instead.</div>
+          <div id="nav-status" class="hint"></div>
+        </div>
+        <div class="hint">Waypoints: coming next.</div>
+      </section>
     </aside>
+
+    <div id="editor-modal" class="modal" hidden>
+      <div class="modal-box editor-box">
+        <div class="modal-head">
+          <strong>Map editor</strong>
+          <button id="editor-close">Close</button>
+        </div>
+        <div class="editor-tools">
+          <button class="etool active" data-tool="occupied">Brush (wall)</button>
+          <button class="etool" data-tool="free">Eraser (free)</button>
+          <button class="etool" data-tool="unknown">Unknown</button>
+          <label>Brush radius (cells) <input type="range" id="editor-size" min="0" max="5" step="0.1" value="1"> <span id="editor-size-val">1.0</span></label>
+          <button id="editor-undo">Undo</button>
+          <button id="zoom-out">&minus;</button>
+          <button id="zoom-in">+</button>
+          <button id="zoom-fit">Fit</button>
+          <span id="zoom-val" class="hint"></span>
+        </div>
+        <canvas id="editor-canvas"></canvas>
+        <div class="editor-save">
+          <label>Save as new map <input type="text" id="editor-name" placeholder="e.g. lab_edited"></label>
+          <button id="editor-save">Save map</button>
+        </div>
+        <div id="editor-status" class="hint"></div>
+      </div>
+    </div>
   </div>
 
 <script>
-const activeBadge = document.getElementById('active-badge');
 const poseBadge = document.getElementById('pose-badge');
 const connEl = document.getElementById('conn');
+async function mapping(action) {
+  const name = document.getElementById('map-name').value.trim();
+  const status = document.getElementById('map-status');
+  if (action === 'stop' && !name) { status.textContent = 'Enter a map name to save.'; return; }
+  const body = { action: action === 'discard' ? 'stop' : action, name: action === 'stop' ? name : '' };
+  status.textContent = 'working...';
+  try {
+    const res = await fetch('/mapping', { method: 'POST', body: JSON.stringify(body) });
+    const data = await res.json();
+    status.textContent = data.detail || data.status;
+  } catch (e) {
+    status.textContent = 'Failed to reach the server.';
+  }
+}
+
+document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('.tabpanel').forEach(p => { p.hidden = p.dataset.panel !== btn.dataset.tab; });
+}));
+const editorModal = document.getElementById('editor-modal');
+document.getElementById('map-edit-btn').addEventListener('click', () => openEditor());
+document.getElementById('editor-close').addEventListener('click', () => { editorModal.hidden = true; });
+editorModal.addEventListener('click', (e) => { if (e.target === editorModal) editorModal.hidden = true; });
+
+
+// ---- Map editor ----
+// Pixel values follow map_server's trinary convention: 0 = occupied, 254 = free, 205 = unknown.
+const PIXEL_FOR_TOOL = { occupied: 0, free: 254, unknown: 205 };
+const ZOOM_MAX = 40;  // screen px per map cell
+let edit = null;  // {name, width, height, resolution, origin, pixels, undo[], tool, size, src, view}
+let editHover = null;  // last hovered screen point, for the brush preview
+const editCanvas = document.getElementById('editor-canvas');
+const editCtx = editCanvas.getContext('2d');
+const editStatus = document.getElementById('editor-status');
+const zoomVal = document.getElementById('zoom-val');
+
+function editSize() {
+  return { w: editCanvas.clientWidth, h: editCanvas.clientHeight };
+}
+
+function fitView() {
+  const { w, h } = editSize();
+  const scale = Math.min(w / edit.width, h / edit.height);
+  edit.view = { scale, ox: (w - edit.width * scale) / 2, oy: (h - edit.height * scale) / 2 };
+}
+
+// Zoom by factor, keeping the screen point (cx, cy) fixed.
+function editZoomAt(cx, cy, factor) {
+  const v = edit.view;
+  const scale = Math.min(ZOOM_MAX, Math.max(v.minScale, v.scale * factor));
+  const k = scale / v.scale;
+  v.ox = cx - (cx - v.ox) * k;
+  v.oy = cy - (cy - v.oy) * k;
+  v.scale = scale;
+  renderEditor();
+}
+
+async function openEditor() {
+  const name = document.getElementById('map-select').value;
+  if (!name) { document.getElementById('map-status').textContent = 'Choose a saved map first.'; return; }
+  const res = await fetch('/map.json?name=' + encodeURIComponent(name));
+  const m = await res.json();
+  if (m.status === 'error') { document.getElementById('map-status').textContent = m.detail; return; }
+  const pixels = Uint8Array.from(atob(m.data), c => c.charCodeAt(0));
+  const keep = edit ? { tool: edit.tool, size: edit.size } : { tool: 'occupied', size: 1.0 };
+  edit = { name, width: m.width, height: m.height, resolution: m.resolution, origin: m.origin,
+           pixels, undo: [], tool: keep.tool, size: keep.size, src: null, view: null };
+  document.getElementById('editor-name').value = name + '_edited';
+  editorModal.hidden = false;
+  editStatus.textContent = `Editing ${name} (${m.width} x ${m.height}). Drag to paint. Wheel or pinch to zoom, right-drag to pan.`;
+  requestAnimationFrame(() => {
+    fitView();
+    edit.view.minScale = edit.view.scale * 0.5;
+    renderEditor();
+  });
+}
+
+function buildSource() {
+  const src = document.createElement('canvas');
+  src.width = edit.width;
+  src.height = edit.height;
+  const sctx = src.getContext('2d');
+  const img = sctx.createImageData(edit.width, edit.height);
+  for (let i = 0; i < edit.pixels.length; i++) {
+    img.data[4 * i] = img.data[4 * i + 1] = img.data[4 * i + 2] = edit.pixels[i];
+    img.data[4 * i + 3] = 255;
+  }
+  sctx.putImageData(img, 0, 0);
+  return src;
+}
+
+function renderEditor() {
+  if (!edit || !edit.view) return;
+  const dpr = window.devicePixelRatio || 1;
+  const { w, h } = editSize();
+  if (editCanvas.width !== Math.round(w * dpr) || editCanvas.height !== Math.round(h * dpr)) {
+    editCanvas.width = Math.round(w * dpr);
+    editCanvas.height = Math.round(h * dpr);
+  }
+  edit.src = buildSource();
+  editCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  editCtx.fillStyle = '#eef0f3';
+  editCtx.fillRect(0, 0, w, h);
+  editCtx.imageSmoothingEnabled = false;
+  const v = edit.view;
+  editCtx.drawImage(edit.src, v.ox, v.oy, edit.width * v.scale, edit.height * v.scale);
+  if (editHover && editPointers.size === 0) drawBrushPreview();
+  zoomVal.textContent = Math.round(100 * v.scale / (v.minScale * 2)) + '%';
+}
+
+// Outline of the brush at its real size, so you can judge it against the walls.
+// The label gives the brush's diameter in cm, from the map resolution.
+function drawBrushPreview() {
+  const v = edit.view;
+  const cx = Math.floor((editHover.x - v.ox) / v.scale);
+  const cy = Math.floor((editHover.y - v.oy) / v.scale);
+  const centreX = v.ox + (cx + 0.5) * v.scale;
+  const centreY = v.oy + (cy + 0.5) * v.scale;
+  const radius = Math.max(edit.size, 0.5) * v.scale;
+  const colour = { occupied: '#000000', free: '#1f9d55', unknown: '#7a7f87' }[edit.tool];
+  editCtx.save();
+  editCtx.lineWidth = 2;
+  editCtx.strokeStyle = colour;
+  editCtx.beginPath();
+  editCtx.arc(centreX, centreY, radius, 0, 2 * Math.PI);
+  editCtx.stroke();
+  editCtx.fillStyle = colour;
+  const cm = (2 * edit.size * edit.resolution * 100).toFixed(0);
+  editCtx.font = '12px sans-serif';
+  editCtx.fillText(`brush ${(2 * edit.size).toFixed(1)} cells = ${cm} cm`, centreX + radius + 6, centreY + 4);
+  editCtx.restore();
+}
+
+function paintAt(x, y) {
+  const v = edit.view;
+  const cx = Math.floor((x - v.ox) / v.scale);
+  const cy = Math.floor((y - v.oy) / v.scale);
+  const value = PIXEL_FOR_TOOL[edit.tool];
+  const r = edit.size;
+  const reach = Math.ceil(r);
+  for (let dy = -reach; dy <= reach; dy++) {
+    for (let dx = -reach; dx <= reach; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const px = cx + dx, py = cy + dy;
+      if (px < 0 || py < 0 || px >= edit.width || py >= edit.height) continue;
+      edit.pixels[py * edit.width + px] = value;
+    }
+  }
+  renderEditor();
+}
+
+// Pointer state: one pointer paints (left button or touch), right/middle drag pans,
+// two touch pointers pinch-zoom and pan together.
+const editPointers = new Map();  // pointerId -> {x, y, button}
+let editMode = null;             // 'paint' | 'pan' | 'pinch'
+let pinchStart = null;           // {dist, mx, my}
+
+function localXY(e) {
+  const rect = editCanvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+editCanvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+editCanvas.addEventListener('pointerdown', (e) => {
+  if (!edit || !edit.view) return;
+  const p = localXY(e);
+  editPointers.set(e.pointerId, { x: p.x, y: p.y, button: e.button });
+  editCanvas.setPointerCapture(e.pointerId);
+  if (editPointers.size === 1) {
+    if (e.button === 1 || e.button === 2) {
+      editMode = 'pan';
+    } else {
+      editMode = 'paint';
+      edit.undo.push(edit.pixels.slice());
+      if (edit.undo.length > 30) edit.undo.shift();
+      paintAt(p.x, p.y);
+    }
+  } else if (editPointers.size === 2) {
+    if (editMode === 'paint') {
+      edit.pixels = edit.undo.pop();  // the first finger's stroke was only a tap; drop it
+    }
+    editMode = 'pinch';
+    const [a, b] = [...editPointers.values()];
+    pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  }
+});
+
+editCanvas.addEventListener('pointermove', (e) => {
+  const cur = editPointers.get(e.pointerId);
+  if (!edit || !edit.view) return;
+  const p = localXY(e);
+  if (!cur) {
+    editHover = p;
+    renderEditor();
+    return;
+  }
+  const dx = p.x - cur.x, dy = p.y - cur.y;
+  cur.x = p.x;
+  cur.y = p.y;
+  if (editMode === 'paint') {
+    paintAt(p.x, p.y);
+  } else if (editMode === 'pan') {
+    edit.view.ox += dx;
+    edit.view.oy += dy;
+    renderEditor();
+  } else if (editMode === 'pinch' && editPointers.size === 2) {
+    const [a, b] = [...editPointers.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    if (pinchStart.dist > 0) editZoomAt(mx, my, dist / pinchStart.dist);
+    edit.view.ox += mx - pinchStart.mx;
+    edit.view.oy += my - pinchStart.my;
+    pinchStart = { dist, mx, my };
+    renderEditor();
+  }
+});
+
+function endPointer(e) {
+  editPointers.delete(e.pointerId);
+  if (editPointers.size === 0) editMode = null;
+  if (editPointers.size < 2) pinchStart = null;
+}
+editCanvas.addEventListener('pointerup', endPointer);
+editCanvas.addEventListener('pointerleave', () => { editHover = null; renderEditor(); });
+editCanvas.addEventListener('pointercancel', endPointer);
+
+editCanvas.addEventListener('wheel', (e) => {
+  if (!edit || !edit.view) return;
+  e.preventDefault();
+  const p = localXY(e);
+  editZoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+document.getElementById('zoom-in').addEventListener('click', () => {
+  if (!edit || !edit.view) return;
+  const { w, h } = editSize();
+  editZoomAt(w / 2, h / 2, 1.25);
+});
+document.getElementById('zoom-out').addEventListener('click', () => {
+  if (!edit || !edit.view) return;
+  const { w, h } = editSize();
+  editZoomAt(w / 2, h / 2, 0.8);
+});
+document.getElementById('zoom-fit').addEventListener('click', () => {
+  if (!edit) return;
+  fitView();
+  edit.view.minScale = edit.view.scale * 0.5;
+  renderEditor();
+});
+
+document.querySelectorAll('.etool').forEach(btn => btn.addEventListener('click', () => {
+  if (!edit) return;
+  edit.tool = btn.dataset.tool;
+  document.querySelectorAll('.etool').forEach(b => b.classList.toggle('active', b === btn));
+}));
+document.getElementById('editor-size').addEventListener('input', (e) => {
+  if (!edit) return;
+  edit.size = Number(e.target.value);
+  document.getElementById('editor-size-val').textContent = edit.size.toFixed(1);
+  renderEditor();
+});
+document.getElementById('editor-undo').addEventListener('click', () => {
+  if (!edit || edit.undo.length === 0) return;
+  edit.pixels = edit.undo.pop();
+  renderEditor();
+});
+
+document.getElementById('editor-save').addEventListener('click', async () => {
+  if (!edit) return;
+  const name = document.getElementById('editor-name').value.trim();
+  if (!name) { editStatus.textContent = 'Enter a name for the new map.'; return; }
+  let bin = '';
+  for (let i = 0; i < edit.pixels.length; i++) bin += String.fromCharCode(edit.pixels[i]);
+  editStatus.textContent = 'saving...';
+  try {
+    const res = await fetch('/map/save', { method: 'POST', body: JSON.stringify({
+      name, width: edit.width, height: edit.height, resolution: edit.resolution,
+      origin: edit.origin, data: btoa(bin) }) });
+    const data = await res.json();
+    editStatus.textContent = data.status === 'ok'
+      ? `Saved as ${data.saved}. It appears in the map list after a page reload.`
+      : data.detail;
+  } catch (e) {
+    editStatus.textContent = 'Failed to reach the server.';
+  }
+});
+
+// Battery indicator. Placeholder only: random walk until the BMS is wired in.
+// To connect the real BMS, replace batteryPlaceholderPercent() with a read of
+// the BMS value (for example a /battery_state topic, polled like the other status).
+const batteryEl = document.getElementById('battery');
+let batteryPct = 72;
+function batteryPlaceholderPercent() {
+  batteryPct = Math.min(100, Math.max(5, batteryPct + (Math.random() * 6 - 3)));
+  return Math.round(batteryPct);
+}
+function renderBattery(pct) {
+  batteryEl.querySelector('.battery-fill').style.width = pct + '%';
+  batteryEl.querySelector('.battery-pct').textContent = pct + '%';
+  batteryEl.classList.toggle('critical', pct < 15);
+  batteryEl.classList.toggle('low', pct >= 15 && pct < 30);
+}
+renderBattery(batteryPlaceholderPercent());
+setInterval(() => renderBattery(batteryPlaceholderPercent()), 3000);
+
 const amrStatusEl = document.getElementById('amr-status');
 const modeButtons = document.querySelectorAll('button[data-mode]');
 const modePanelEl = document.getElementById('mode-panel');
-const rviz2Btn = document.getElementById('rviz2-btn');
 
 // Software-only "EMERGENCY STOP" (2026-10-02) - see this button's own hint
 // text in the HTML and twist_mux.yaml's software_stop entry for exactly
@@ -461,22 +954,6 @@ estopBtn.addEventListener('click', () => {
   } else {
     clearInterval(estopInterval);
     estopInterval = null;
-  }
-});
-
-rviz2Btn.addEventListener('click', async () => {
-  const prevText = rviz2Btn.textContent;
-  rviz2Btn.textContent = '...';
-  rviz2Btn.disabled = true;
-  try {
-    const res = await fetch('/launch_rviz2', { method: 'POST' });
-    const data = await res.json();
-    rviz2Btn.title = data.detail;
-  } catch (e) {
-    rviz2Btn.title = 'Failed to reach the server';
-  } finally {
-    rviz2Btn.textContent = prevText;
-    rviz2Btn.disabled = false;
   }
 });
 
@@ -516,31 +993,16 @@ async function pollStatus() {
   }
 }
 
-async function pollActive() {
-  try {
-    const res = await fetch('/active.json', { cache: 'no-store' });
-    const data = await res.json();
-    activeBadge.className = 'badge ' + (data.received && data.source !== 'none' ? 'ok' : 'unknown');
-    activeBadge.textContent = data.received ? `Source: ${data.source}` : 'Source: unknown';
-  } catch (e) {
-    activeBadge.className = 'badge unknown';
-    activeBadge.textContent = 'Source: unknown';
-  }
-}
-
 // Exact key bindings from ros2 run teleop_twist_keyboard teleop_twist_keyboard
 // (its own printed banner) - i/,/j/l drive, u/o/m/. are diagonals, k or any
 // other key stops.
-const TELEOP_PANEL = `<strong>Keyboard teleop</strong> - drives straight from this page, no terminal needed.
-    Just press the keys below (this browser tab needs focus, but not any particular element in it):
-    <div class="keygrid">
+const TELEOP_PANEL = `<div class="keygrid">
       <span data-key="u">u</span><span data-key="i">i</span><span data-key="o">o</span>
       <span data-key="j">j</span><span data-key="k">k</span><span data-key="l">l</span>
       <span data-key="m">m</span><span data-key=",">,</span><span data-key=".">.</span>
     </div>
-    i/, = forward/backward, j/l = pivot left/right, u/o/m/. = diagonal, k or releasing = stop.
-    <div class="hint">Same bindings as <code>ros2 run teleop_twist_keyboard</code> - captured by this
-    page's own keydown/keyup handlers and published on /cmd_vel_teleop instead.</div>`;
+    <div class="hint">k or release = stop.</div>
+    `;
 
 // One on/off toggle now, not a 3-way mode selector (2026-10-01) - "Remote"
 // and "Navigation" never gated anything here even before this simplification
@@ -560,11 +1022,12 @@ async function setMode(mode) {
   btn.textContent = mode === 'teleop' ? 'Keyboard control: ON' : 'Keyboard control: OFF';
   btn.classList.toggle('active', mode === 'teleop');
   modePanelEl.innerHTML = mode === 'teleop' ? TELEOP_PANEL : '';
+  syncTeleopSliders();
   setJoystickVisible(mode === 'teleop');
   try {
     await fetch('/mode', { method: 'POST', body: mode });
   } catch (e) {
-    activeBadge.textContent = 'Failed to set mode';
+    // Mode is UI-only state; a failed POST just leaves the server's last value.
   }
 }
 modeButtons.forEach(b => b.addEventListener('click', () => setMode(currentMode === 'teleop' ? 'none' : 'teleop')));
@@ -576,12 +1039,53 @@ const TELEOP_BINDINGS = {
   i: [1, 0], o: [1, -1], j: [0, 1], l: [0, -1], u: [1, 1],
   ',': [-1, 0], '.': [-1, 1], m: [-1, -1],
 };
-const TELEOP_LINEAR_SPEED = 0.5;   // m/s - matches teleop_twist_keyboard's own default
-const TELEOP_ANGULAR_SPEED = 1.0;  // rad/s - matches teleop_twist_keyboard's own default
+// Defaults match teleop_twist_keyboard's own; the sliders in the teleop panel change them.
+let teleopLinearMax = 0.5;   // m/s
+let teleopAngularMax = 1.0;  // rad/s
+
+// The slider elements are recreated every time the panel is rendered, so their
+// values are re-applied from these variables after each render.
+function syncTeleopSliders() {
+  const lin = document.getElementById('teleop-lin');
+  if (!lin) return;
+  document.getElementById('teleop-ang').value = teleopAngularMax;
+  lin.value = teleopLinearMax;
+  document.getElementById('teleop-lin-val').textContent = teleopLinearMax.toFixed(2);
+  document.getElementById('teleop-ang-val').textContent = teleopAngularMax.toFixed(1);
+  // 17 cm wheel diameter, same as the ROS config's wheel_radius = 0.085 m.
+  const rpm = teleopLinearMax / (Math.PI * 0.17) * 60;
+  document.getElementById('teleop-lin-rpm').textContent = `(about ${rpm.toFixed(0)} wheel rpm)`;
+}
+document.addEventListener('input', (evt) => {
+  if (evt.target.id === 'teleop-lin') teleopLinearMax = parseFloat(evt.target.value);
+  else if (evt.target.id === 'teleop-ang') teleopAngularMax = parseFloat(evt.target.value);
+  else return;
+  syncTeleopSliders();
+});
+// Posted on release, not on every drag tick: the server republishes the value
+// for the RF remote too, so this only needs to happen once per adjustment.
+document.addEventListener('change', (evt) => {
+  if (evt.target.id !== 'teleop-lin' && evt.target.id !== 'teleop-ang') return;
+  fetch('/speed', { method: 'POST', body: JSON.stringify({ linear: teleopLinearMax, angular: teleopAngularMax }) })
+    .then(r => r.json())
+    .then(d => { teleopLinearMax = d.linear; teleopAngularMax = d.angular; syncTeleopSliders(); })
+    .catch(() => {});
+});
+fetch('/speed.json').then(r => r.json()).then(d => {
+  teleopLinearMax = d.linear;
+  teleopAngularMax = d.angular;
+  syncTeleopSliders();
+}).catch(() => {});
 let teleopKey = null;
 
+// Every command is tagged with this page's session and an increasing sequence
+// number, so the server can drop late, stale commands (see publish_teleop).
+const teleopSession = Math.random().toString(36).slice(2);
+let teleopSeq = 0;
 function teleopPublish(linear, angular) {
-  fetch('/teleop', { method: 'POST', body: JSON.stringify({ linear, angular }) }).catch(() => {});
+  const seq = ++teleopSeq;
+  fetch('/teleop', { method: 'POST', body: JSON.stringify({ linear, angular, session: teleopSession, seq }) })
+    .catch(() => {});
 }
 
 function highlightTeleopKey() {
@@ -609,7 +1113,7 @@ window.addEventListener('keydown', (evt) => {
   evt.preventDefault();
   teleopKey = evt.key;
   highlightTeleopKey();
-  teleopPublish(binding[0] * TELEOP_LINEAR_SPEED, binding[1] * TELEOP_ANGULAR_SPEED);
+  teleopPublish(binding[0] * teleopLinearMax, binding[1] * teleopAngularMax);
 });
 window.addEventListener('keyup', (evt) => {
   if (evt.key === teleopKey) stopTeleopKey();
@@ -620,7 +1124,7 @@ window.addEventListener('blur', stopTeleopKey);
 setInterval(() => {
   if (currentMode === 'teleop' && teleopKey && TELEOP_BINDINGS[teleopKey]) {
     const binding = TELEOP_BINDINGS[teleopKey];
-    teleopPublish(binding[0] * TELEOP_LINEAR_SPEED, binding[1] * TELEOP_ANGULAR_SPEED);
+    teleopPublish(binding[0] * teleopLinearMax, binding[1] * teleopAngularMax);
   }
 }, 200);
 
@@ -657,7 +1161,7 @@ function joystickPublish() {
   const [nx, ny] = joystickVec;
   // Pushing the stick up (negative ny) drives forward; pushing right
   // (positive nx) turns right (angular.z negative, CW per REP-103).
-  teleopPublish(-ny * TELEOP_LINEAR_SPEED, -nx * TELEOP_ANGULAR_SPEED);
+  teleopPublish(-ny * teleopLinearMax, -nx * teleopAngularMax);
 }
 
 joystickBase.addEventListener('pointerdown', (evt) => {
@@ -737,6 +1241,140 @@ function centerOnRobot() {
 }
 recenterBtn.addEventListener('click', centerOnRobot);
 
+let mapImage = null;  // saved map shown on the canvas: {canvas, width, height, res, ox, oy}
+
+function buildMapImage(m) {
+  const raw = Uint8Array.from(atob(m.data), c => c.charCodeAt(0));
+  const off = document.createElement('canvas');
+  off.width = m.width;
+  off.height = m.height;
+  const octx = off.getContext('2d');
+  const img = octx.createImageData(m.width, m.height);
+  for (let i = 0; i < raw.length; i++) {
+    img.data[4 * i] = raw[i];
+    img.data[4 * i + 1] = raw[i];
+    img.data[4 * i + 2] = raw[i];
+    img.data[4 * i + 3] = 255;
+  }
+  octx.putImageData(img, 0, 0);
+  return { canvas: off, width: m.width, height: m.height, res: m.resolution, ox: m.origin[0], oy: m.origin[1] };
+}
+
+// While mapping runs, the SLAM map is drawn on the main canvas as it grows.
+async function pollLiveMap() {
+  try {
+    const d = await (await fetch('/live_map.json', { cache: 'no-store' })).json();
+    if (!d.active || !d.ready) return;
+    mapImage = buildMapImage(d);
+    document.getElementById('map-status').textContent = `Live map: ${d.width} x ${d.height} cells`;
+  } catch (e) {}
+}
+setInterval(pollLiveMap, 2000);
+pollLiveMap();
+
+async function showMap(name) {
+  if (!name) { mapImage = null; return; }
+  const status = document.getElementById('map-status');
+  try {
+    const res = await fetch('/map.json?name=' + encodeURIComponent(name));
+    const m = await res.json();
+    if (m.status === 'error') { status.textContent = m.detail; mapImage = null; return; }
+    mapImage = buildMapImage(m);
+    status.textContent = `Showing ${name}: ${m.width} x ${m.height} cells at ${m.resolution} m`;
+  } catch (e) {
+    status.textContent = 'Failed to load map.';
+    mapImage = null;
+  }
+}
+
+// The image's rows run along world -y and its columns along world +x. The
+// canvas is north-up with +x up, so the map is drawn through a transform
+// that maps columns to screen-vertical and rows to screen-horizontal.
+function drawMap() {
+  if (!mapImage) return;
+  const s = view.scale * devicePixelRatio;
+  const [px0, py0] = worldToPx(mapImage.ox, mapImage.oy + mapImage.height * mapImage.res);
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.setTransform(0, -mapImage.res * s, mapImage.res * s, 0, px0, py0);
+  ctx.drawImage(mapImage.canvas, 0, 0);
+  ctx.restore();
+}
+
+document.getElementById('map-select').addEventListener('change', (e) => showMap(e.target.value));
+document.getElementById('nav-map-select').addEventListener('change', (e) => showMap(e.target.value));
+fetch('/maps.json').then(r => r.json()).then(d => {
+  const sel = document.getElementById('map-select');
+  const navSel = document.getElementById('nav-map-select');
+  for (const name of d.maps) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+    navSel.appendChild(opt.cloneNode(true));
+  }
+}).catch(() => {});
+
+let canvasClickMode = 'goal';  // 'goal' or 'initialpose' - toggled by nav-pose-mode-btn
+document.getElementById('nav-pose-mode-btn').addEventListener('click', (e) => {
+  canvasClickMode = canvasClickMode === 'goal' ? 'initialpose' : 'goal';
+  e.target.classList.toggle('active', canvasClickMode === 'initialpose');
+  e.target.textContent = canvasClickMode === 'initialpose' ? 'Click the map to set initial pose...' : 'Set initial pose';
+});
+
+async function sendNavigation(action) {
+  const status = document.getElementById('nav-status');
+  const map = document.getElementById('nav-map-select').value;
+  status.textContent = 'working...';
+  try {
+    const res = await fetch('/navigation', { method: 'POST', body: JSON.stringify({ action, map }) });
+    const data = await res.json();
+    status.textContent = data.detail || data.status;
+  } catch (e) {
+    status.textContent = 'Failed to reach the server.';
+  }
+}
+document.getElementById('nav-start-btn').addEventListener('click', () => {
+  if (!document.getElementById('nav-map-select').value) {
+    document.getElementById('nav-status').textContent = 'Choose a map first.';
+    return;
+  }
+  sendNavigation('start');
+});
+document.getElementById('nav-stop-btn').addEventListener('click', () => sendNavigation('stop'));
+
+// Robot footprint, from calixto-ros-bot.md: length 780 mm, width 480 mm.
+// LiDAR: 80 mm behind the front edge, centred side to side -> 390 - 80 = 310 mm forward of centre.
+// LIDAR_YAW is the LiDAR zero direction relative to robot forward (lidar.xacro: rpy yaw 3.14159).
+const ROBOT_LENGTH = 0.78;
+const ROBOT_WIDTH = 0.48;
+const LIDAR_OFFSET = [0.31, 0.0];
+const LIDAR_YAW = 0;
+
+function drawRobotOutline() {
+  if (!latestPose) return;
+  const c = Math.cos(latestPose.theta), s = Math.sin(latestPose.theta);
+  const toWorld = (x, y) => [latestPose.x + x * c - y * s, latestPose.y + x * s + y * c];
+  const hl = ROBOT_LENGTH / 2, hw = ROBOT_WIDTH / 2;
+  const corners = [[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]];
+  ctx.save();
+  ctx.beginPath();
+  corners.forEach(([x, y], i) => {
+    const [px, py] = worldToPx(...toWorld(x, y));
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  });
+  ctx.closePath();
+  ctx.strokeStyle = '#e0a030';
+  ctx.lineWidth = 2 * devicePixelRatio;
+  ctx.stroke();
+  const [lx, ly] = worldToPx(...toWorld(LIDAR_OFFSET[0], LIDAR_OFFSET[1]));
+  ctx.fillStyle = '#1f9d55';
+  ctx.beginPath();
+  ctx.arc(lx, ly, 4 * devicePixelRatio, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.restore();
+}
+
 function draw() {
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -756,6 +1394,9 @@ function draw() {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
   }
 
+  drawMap();
+  drawRobotOutline();
+
   if (latestPose) {
     // Breadcrumb trail.
     ctx.fillStyle = '#9fb3d6';
@@ -771,17 +1412,22 @@ function draw() {
     // the laser's own 0deg points along the robot's forward +x - true until
     // an actual mount offset/static transform is set up.
     if (latestScan && latestScan.ranges) {
-      ctx.fillStyle = 'rgba(224, 70, 50, 0.65)';
+      ctx.fillStyle = 'rgba(224, 70, 50, 0.8)';
       const a0 = latestScan.angle_min, da = latestScan.angle_increment;
       const rmin = latestScan.range_min, rmax = latestScan.range_max;
+      // Scan rays start at the LiDAR, not the robot centre.
+      const lc = Math.cos(latestPose.theta), ls = Math.sin(latestPose.theta);
+      const laserX = latestPose.x + LIDAR_OFFSET[0] * lc - LIDAR_OFFSET[1] * ls;
+      const laserY = latestPose.y + LIDAR_OFFSET[0] * ls + LIDAR_OFFSET[1] * lc;
       for (let i = 0; i < latestScan.ranges.length; i++) {
         const r = latestScan.ranges[i];
         if (r === null || r < rmin || r > rmax) continue;
-        const angle = latestPose.theta + a0 + i * da;
-        const wx = latestPose.x + r * Math.cos(angle);
-        const wy = latestPose.y + r * Math.sin(angle);
+        const angle = latestPose.theta + LIDAR_YAW + a0 + i * da;
+        const wx = laserX + r * Math.cos(angle);
+        const wy = laserY + r * Math.sin(angle);
         const [px, py] = worldToPx(wx, wy);
-        ctx.beginPath(); ctx.arc(px, py, 1.5 * devicePixelRatio, 0, 7); ctx.fill();
+        // 2026-10-08: radius 1.5 -> 3.0, the scan was hard to read on the map.
+        ctx.beginPath(); ctx.arc(px, py, 3.0 * devicePixelRatio, 0, 7); ctx.fill();
       }
     }
 
@@ -861,9 +1507,34 @@ async function publishGoalFromDrag(d) {
   // world +y) - convert to a world heading; a negligible drag just faces
   // the goal's current heading (0).
   const theta = dragDist > 8 ? Math.atan2(-dx, -dy) : 0;
-  try {
-    await fetch('/goal', { method: 'POST', body: JSON.stringify({ x: gx, y: gy, theta: theta }) });
-  } catch (e) { /* best-effort */ }
+  const isPose = canvasClickMode === 'initialpose';
+  const url = isPose ? '/initial_pose' : '/goal';
+  const status = document.getElementById('nav-status');
+  const body = JSON.stringify({ x: gx, y: gy, theta: theta });
+  if (isPose) {
+    // Resending is safe here: AMCL just takes the latest estimate, it does not
+    // treat each message as a new request. This guards against a one-shot
+    // message landing before AMCL's subscription has finished connecting.
+    for (let i = 0; i < 5; i++) {
+      try { await fetch(url, { method: 'POST', body }); } catch (e) { /* best-effort */ }
+      if (i < 4) await new Promise(r => setTimeout(r, 250));
+    }
+  } else {
+    // Exactly one send: bt_navigator treats every /goal_pose message as a new
+    // navigation request and cancels whatever was running - resending here
+    // would cancel and restart navigation repeatedly instead of helping it.
+    try { await fetch(url, { method: 'POST', body }); } catch (e) { /* best-effort */ }
+  }
+  status.textContent = isPose
+    ? `Initial pose sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}. Check "Pose:" above says "localized".`
+    : `Goal sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}.`;
+  if (isPose) {
+    // One-shot: back to goal mode so a stray drag can't send another pose.
+    canvasClickMode = 'goal';
+    const btn = document.getElementById('nav-pose-mode-btn');
+    btn.classList.remove('active');
+    btn.textContent = 'Set initial pose';
+  }
 }
 
 window.addEventListener('mouseup', (evt) => {
@@ -984,13 +1655,23 @@ async function pollPose() {
       latestPose = null;
       return;
     }
-    latestPose = data;
+    // Pose/odom is in the odom frame. Once AMCL is localized, the server also
+    // sends the map->odom correction; apply it so the robot, its outline, and
+    // the scan draw aligned with the saved map (which is in the map frame).
+    let x = data.x, y = data.y, theta = data.theta, frame = data.frame_id;
+    if (data.map_to_odom) {
+      const m = data.map_to_odom;
+      const c = Math.cos(m.theta), s = Math.sin(m.theta);
+      const mx = m.x + x * c - y * s, my = m.y + x * s + y * c;
+      x = mx; y = my; theta = theta + m.theta; frame = 'map';
+    }
+    latestPose = { x, y, theta, stamp: data.stamp, frame_id: frame };
     if (!view.initialized) { centerOnRobot(); view.initialized = true; }
-    trail.push([data.x, data.y]);
+    trail.push([x, y]);
     if (trail.length > 400) trail.shift();
     const age = (Date.now() / 1000) - data.stamp;
     poseBadge.className = 'badge ' + (age > 1.0 ? 'unknown' : 'ok');
-    poseBadge.textContent = `Pose: ${data.x.toFixed(2)}, ${data.y.toFixed(2)} (${data.frame_id})`;
+    poseBadge.textContent = `Pose: ${x.toFixed(2)}, ${y.toFixed(2)} (${frame}${data.map_to_odom ? ', localized' : ''})`;
   } catch (e) {
     poseBadge.className = 'badge unknown';
     poseBadge.textContent = 'Pose: unknown';
@@ -1008,11 +1689,9 @@ async function pollScan() {
 }
 
 pollStatus();
-pollActive();
 pollPose();
 pollScan();
 setInterval(pollStatus, 500);
-setInterval(pollActive, 500);
 setInterval(pollPose, 150);
 setInterval(pollScan, 200);
 </script>
@@ -1046,11 +1725,54 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
         elif self.path == "/pose.json":
             with _pose_lock:
                 data = dict(_latest_pose)
+            if data.get("received"):
+                data["map_to_odom"] = self.server.hmi_node.get_map_to_odom()
             self._send_json(data)
         elif self.path == "/scan.json":
             with _scan_lock:
                 data = dict(_latest_scan)
             self._send_json(data)
+        elif self.path == "/speed.json":
+            lin, ang = self.server.hmi_node.speed_limits
+            self._send_json({"linear": lin, "angular": ang})
+        elif self.path == "/live_map.json":
+            if not os.path.exists("/tmp/mapping.pids"):
+                self._send_json({"active": False})
+            else:
+                with _live_map_lock:
+                    m = _latest_live_map
+                if m is None:
+                    self._send_json({"active": True, "ready": False})
+                else:
+                    self._send_json({"active": True, "ready": True, "width": m["width"],
+                                     "height": m["height"], "resolution": m["resolution"],
+                                     "origin": m["origin"],
+                                     "data": base64.b64encode(m["data"]).decode("ascii")})
+        elif self.path == "/maps.json":
+            self._send_json({"maps": _list_maps()})
+        elif self.path.startswith("/map.json"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = query.get("name", [""])[0]
+            if not _valid_map_name(name) or not os.path.isfile(os.path.join(_MAPS_DIR, name + ".yaml")):
+                self._send_json({"status": "error", "detail": "unknown map"}, status=404)
+                return
+            try:
+                self._send_json(_load_map(name))
+            except (OSError, ValueError, KeyError) as e:
+                self._send_json({"status": "error", "detail": f"could not read map: {e}"}, status=500)
+        elif self.path.startswith("/assets/"):
+            fpath = os.path.join(_ASSETS_DIR, os.path.basename(self.path))
+            if not os.path.isfile(fpath):
+                self.send_response(404)
+                self.end_headers()
+                return
+            with open(fpath, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path in ("/", "/index.html"):
             body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
@@ -1082,6 +1804,40 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 return
             self.server.hmi_node.publish_goal(x, y, theta)
             self._send_json({"status": "ok"})
+        elif self.path == "/initial_pose":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                x, y, theta = float(data["x"]), float(data["y"]), float(data["theta"])
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad initial pose payload: {e}"}, status=400)
+                return
+            self.server.hmi_node.publish_initial_pose(x, y, theta)
+            self._send_json({"status": "ok"})
+        elif self.path == "/navigation":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                action = data["action"]
+                map_name = data.get("map", "")
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad navigation payload: {e}"}, status=400)
+                return
+            docker_dir = "/ros2_ws/src/ros-amr/docker"
+            if action == "start":
+                if not _valid_map_name(map_name):
+                    self._send_json({"status": "error", "detail": "choose a map first"}, status=400)
+                    return
+                cmd = ["bash", f"{docker_dir}/start_navigation.sh", map_name]
+            elif action == "stop":
+                cmd = ["bash", f"{docker_dir}/stop_navigation.sh"]
+            else:
+                self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
+                return
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                detail = (res.stdout + res.stderr).strip().splitlines()[-1:] or ["done"]
+                self._send_json({"status": "ok" if res.returncode == 0 else "error", "detail": detail[0]})
+            except subprocess.TimeoutExpired:
+                self._send_json({"status": "error", "detail": "navigation script timed out"}, status=500)
         elif self.path == "/teleop":
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -1089,13 +1845,57 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             except (ValueError, KeyError, json.JSONDecodeError) as e:
                 self._send_json({"status": "error", "detail": f"bad teleop payload: {e}"}, status=400)
                 return
-            self.server.hmi_node.publish_teleop(linear, angular)
-            self._send_json({"status": "ok"})
+            session, seq = data.get("session"), data.get("seq")
+            accepted = self.server.hmi_node.publish_teleop(linear, angular, session, seq)
+            self._send_json({"status": "ok", "accepted": accepted})
+        elif self.path == "/mapping":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                action = data["action"]
+                name = data.get("name", "")
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad mapping payload: {e}"}, status=400)
+                return
+            docker_dir = "/ros2_ws/src/ros-amr/docker"
+            if action == "start":
+                cmd = ["bash", f"{docker_dir}/start_mapping.sh"]
+            elif action == "stop":
+                if name and not (name.replace("_", "").replace("-", "").isalnum() and len(name) <= 40):
+                    self._send_json({"status": "error", "detail": "map name: letters, digits, _ and - only"}, status=400)
+                    return
+                cmd = ["bash", f"{docker_dir}/stop_mapping.sh"] + (["--save", name] if name else [])
+            else:
+                self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
+                return
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                detail = (res.stdout + res.stderr).strip().splitlines()[-1:] or ["done"]
+                self._send_json({"status": "ok" if res.returncode == 0 else "error", "detail": detail[0]})
+            except subprocess.TimeoutExpired:
+                self._send_json({"status": "error", "detail": "mapping script timed out"}, status=500)
+        elif self.path == "/map/save":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                saved = _save_map(data)
+            except FileExistsError as e:
+                self._send_json({"status": "error", "detail": str(e)}, status=409)
+                return
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad map save: {e}"}, status=400)
+                return
+            self._send_json({"status": "ok", "saved": saved})
+        elif self.path == "/speed":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                lin, ang = float(data["linear"]), float(data["angular"])
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad speed payload: {e}"}, status=400)
+                return
+            new_lin, new_ang = self.server.hmi_node.publish_speed(lin, ang)
+            self._send_json({"status": "ok", "linear": new_lin, "angular": new_ang})
         elif self.path == "/estop":
             self.server.hmi_node.publish_estop()
             self._send_json({"status": "ok"})
-        elif self.path == "/launch_rviz2":
-            self._send_json(_launch_rviz2())
         else:
             self.send_response(404)
             self.end_headers()

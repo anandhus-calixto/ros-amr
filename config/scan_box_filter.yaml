@@ -1,0 +1,30 @@
+# Removes LiDAR returns on the robot body (chassis, poles, wiring). Box in base_link:
+# chassis is 0.78 x 0.48 m centred on base_link.
+# 2026-10-08: was a 0.01 m INSET (0.76 x 0.46, i.e. just inside the chassis edge).
+# Now a BUFFER OUTSIDE the body instead. 2026-10-08: 5% -> 10% -> 25%
+# (0.975 x 0.600), i.e. 98 mm clear of the chassis in x and 60 mm in y.
+# Being raised by trial to chase body returns that keep showing up; if this
+# much margin is really needed, suspect the LiDAR mount offset in
+# description/lidar.xacro rather than keeping the box growing. Returns from
+# wiring, brackets and anything else sitting slightly proud of the chassis are
+# removed too, and small mounting/calibration offsets do not leak body points
+# into the scan.
+# Trade-off: obstacles within ~4 cm (x) / ~2.4 cm (y) of the chassis edge are
+# filtered out as
+# well, so the local costmap cannot see something pressed right against the
+# robot. The bumper (firmware-latched) remains the protection at that range.
+# invert: false removes the points INSIDE the box.
+scan_to_scan_filter_chain:
+  ros__parameters:
+    filter1:
+      name: body_box
+      type: laser_filters/LaserScanBoxFilter
+      params:
+        box_frame: base_link
+        min_x: -0.488
+        max_x: 0.488
+        min_y: -0.300
+        max_y: 0.300
+        min_z: -1.0
+        max_z: 1.0
+        invert: false

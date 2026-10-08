@@ -2,7 +2,12 @@ twist_mux:
   ros__parameters:
     topics:
       navigation:
-        topic: cmd_vel
+        # 2026-10-07: was "cmd_vel", which collides with the real final command
+        # topic (/cmd_vel, TwistStamped, via the controller_manager remap and
+        # twist_stamper.py) - harmless only because nothing ever actually
+        # published a plain Twist there. Nav2's controller_server is remapped
+        # to publish here instead (see docker/start_navigation.sh).
+        topic: cmd_vel_nav
         timeout: 0.5
         priority: 10
       teleop:

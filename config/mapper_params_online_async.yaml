@@ -22,7 +22,7 @@ slam_toolbox:
     # will use pose
     #map_file_name: /home/anandhu-sudha/ws_ros2/lab_serial
     #map_file_name: /home/anandhu-sudha/ws_ros2/src/calixto-ros-bot/maps/map_sim_new_serial
-    map_file_name: /home/anandhu-sudha/ws_ros2/my_map_sim_new
+    map_file_name: ""
     # map_start_pose: [0.0, 0.0, 0.0]
     map_start_at_dock: true
 

@@ -1,0 +1,13 @@
+TO TEST THE ROS2_CONROL
+------------------------------
+-To run the ros2_control pluggin with rviz (with and without hardware)
+
+// wihtout hardware
+ros2 launch calixto-ros-bot diffbot.launch.py use_mock_hardware:=true 
+
+// with hardware
+ros2 launch calixto-ros-bot diffbot.launch.py use_mock_hardware:=false
+
+-To run the teleop twist keyboard for keyboard control::
+
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/cmd_vel -p stamped:=true

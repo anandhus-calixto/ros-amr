@@ -18,7 +18,18 @@ diffbot_base_controller:
     left_wheel_names:  ["left_wheel_joint"]
     right_wheel_names: ["right_wheel_joint"]
 
-    wheel_separation: 0.35
+    # 2026-10-08: was 0.35. This is the EFFECTIVE track, calibrated from
+    # motion, not the tape measurement - they are not the same number.
+    # Geometric centre-to-centre measures 0.400 m, but 45 mm-wide crowned
+    # tyres contact inboard of their centreline, so the robot pivots about
+    # ~0.384 m. Derived from +0.3 and -0.3 rad/s spins (0.3828 / 0.3852)
+    # against the BNO055 gyro, after correcting that gyro for the +1.02%
+    # scale error found by a closed-loop 3-turn test (it read 1080.9 deg
+    # for a physical 1070 deg). wheel_radius 0.085 confirmed separately to
+    # 0.08% over a tape-measured 0.91 m straight run.
+    # Floor-dependent: scrub changes with surface, so re-derive if the
+    # tyres or the floor change. scripts/verify_angular_rate.py re-runs it.
+    wheel_separation: 0.384
     wheel_radius: 0.085
     wheel_separation_multiplier: 1.0
     left_wheel_radius_multiplier: 1.0

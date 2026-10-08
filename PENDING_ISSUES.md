@@ -2,6 +2,143 @@
 
 Running list of known gaps/temporary fixes that need real follow-up. Newest on top.
 
+## 2026-10-08 — RViz freezes: tf2 BufferCore deadlock (root cause found, mitigated not fixed)
+
+RViz2 hangs permanently after anywhere from ~1 to ~7 minutes, the window stops
+redrawing, GNOME shows "rviz2 is not responding", and force-quitting it is what
+produced every `exit code -9` ("crash") seen on 2026-10-07. The kill was the
+symptom; the hang is the bug.
+
+### Root cause
+
+An AB-BA deadlock between two mutexes inside the SAME `tf2::BufferCore`
+object. Caught with gdb while hung (needs `sudo sysctl -w
+kernel.yama.ptrace_scope=0`, default 1 blocks attaching):
+
+    Thread 1 (GUI)          waits futex 0x...bf0
+      VisualizationManager::onUpdate -> Executor::spin_some_impl
+       -> execute_subscription (LaserScan)
+        -> TFFrameTransformer::waitForTransform
+         -> tf2_ros::Buffer::waitForTransform
+          -> tf2::BufferCore::addTransformableRequest   <-- blocked
+
+    Thread 16 (TF listener) waits futex 0x...ca0
+      TransformListener::subscription_callback
+       -> BufferCore::setTransform -> setTransformImpl
+        -> BufferCore::testTransformableRequests        <-- blocked
+
+The two futex addresses are 176 bytes apart, i.e. two members of one
+BufferCore, taken in opposite orders. It never recovers.
+
+Trigger: a message arrives whose transform to the fixed frame is not yet
+available, so the display's TF message filter registers a "transformable
+request" - exactly the `Message Filter dropping message ... queue is full`
+lines that appear in every RViz log here. The TF listener then services those
+requests while inserting a transform, and the two collide.
+
+Upstream tf2 bug, not a config error. `ros-humble-tf2` 0.25.23 is installed and
+apt has no newer candidate, so there is nothing to upgrade to yet. Re-check
+after a ROS distro update.
+
+### What this is NOT (all tested and ruled out on 2026-10-08)
+
+  * Not the network. It deadlocks identically replaying a LOCAL bag with zero
+    sockets to the robot. WiFi jitter (laptop->robot avg 23 ms, max 141 ms, vs
+    ~5-6 ms from each machine to the router) makes it MORE FREQUENT, because
+    late transforms mean more pending requests - but it is not the cause.
+  * Not the GPU. Moving RViz to the NVIDIA GTX 1650 via
+    `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia` removed the
+    harmless Ogre/Mesa "active samplers" GLSL error but changed nothing else.
+  * Not XWayland. The session was switched to Xorg (`loginctl show-session`
+    Type=x11) and it still deadlocked. qtwayland5 is pointless here - there is
+    no Wayland compositor running, so `wl_display` connection is refused.
+  * Not OOM (`memory.events` oom_kill 0), not the kernel (journal completely
+    silent at every hang), not costmap display load (disabled both, still hung).
+
+### How to run RViz without it hanging
+
+The deadlock is reached through TF MESSAGE FILTERS, and the LaserScan display
+is by far the worst offender because it runs at 15 Hz while the map and costmap
+displays run at ~1.7 Hz. Dropping LaserScan is roughly a 10x cut in exposure.
+
+IMPORTANT: this is mitigation, not immunity. The Map and costmap displays use
+TF message filters too, so they can still reach the same lock pair - just much
+less often.
+
+  * For costmap/plan work, use the config that has no LaserScan at all:
+
+        ros2 launch calixto-ros-bot rviz_remote.launch.py \
+            rviz_config:=$(ros2 pkg prefix calixto-ros-bot)/share/calixto-ros-bot/rviz/costmap_analysis.rviz
+
+    (`rviz/costmap_analysis.rviz`: Grid, RobotModel, Map, LocalCostmap,
+    GlobalCostmap, GlobalPlan, LocalPlan, Footprint; fixed frame map.)
+
+  * If the LiDAR scan IS needed, `rviz/lidar_robot_odom.rviz` uses fixed frame
+    `odom` instead of `map`, so the scan needs only odom->laser_frame, which is
+    always present. Partial help: it narrows the window but scan drops still
+    occur, so requests still get registered.
+
+  * Add the NVIDIA offload env vars. They do not prevent the hang but they do
+    remove the GLSL error and give smoother rendering:
+
+        export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+  * For deep analysis prefer `docker/record_bag.sh` on the robot + `ros2 bag
+    play` locally over long live sessions - less exposure, and you can scrub
+    and repeat. NOTE: that script currently MISSES `/map` and other
+    TRANSIENT_LOCAL topics, because rosbag2 on Humble subscribes VOLATILE by
+    default. Needs a QoS override file before those bags are useful.
+
+### Catching it again
+
+`scripts/`-less helper lives in the session scratchpad, but the method is:
+set `kernel.yama.ptrace_scope=0`, poll `/proc/<pid>/wchan` once a second, and
+when it stays `futex_wait_queue` for ~25 s run
+`gdb -p <pid> -batch -ex "thread apply all bt 25"`. Normal operation cycles
+through `do_poll`/`0`, so a long solid futex streak is a real hang.
+
+## 2026-10-07 — LiDAR body filter: check CPU overhead once mapping and navigation run
+
+The laser_filters box filter (`config/scan_box_filter.yaml`, run as step 8 in
+`docker/run_full_stack.sh`) removes LiDAR returns on the robot body: the four
+load poles and the wiring inside the chassis. Its box is x ±0.40 m, y ±0.25 m
+in base_link, with a 1 cm margin. Mapping and the web UI read `/scan_filtered`.
+
+**Measured so far (idle stack, robot still):**
+- Filter: about 3% of one core, instantaneous. The earlier Python version
+  (`scripts/scan_body_filter.py`) used about 20%, so it was replaced.
+- Whole board: load about 2.6 on 4 cores (about 65%), temperatures 51–53 °C,
+  no throttling. Top consumers: `bno055` about 39%, web UI about 32%, EKF about 10%.
+
+**To check later:**
+- Re-measure the filter's CPU while mapping and while navigation run. Those add
+  more load than the filter does.
+- Confirm the box still removes the poles after any change to the robot's
+  dimensions or the LiDAR position (`description/robot_core.xacro`, `lidar.xacro`).
+- Check the `bno055` load, which is the largest single consumer.
+
+## 2026-10-03 — Web keyboard/joystick keeps moving after release on a laggy network (partly fixed, on hold)
+
+Observed by the owner: when the network lags, the wheels keep moving after a
+key is released. Cause: the browser sends commands as separate HTTP POSTs,
+which queue and arrive late and out of order. A stale motion command arriving
+after the stop restarts motion for another 0.5 s (the twist_mux teleop timeout).
+
+Reproduced on the board with a simulated laggy client (random 0–2 s per request,
+`teleop_lag_test.py`, not committed). Before the fix, stale motion arrived up to
+1.6 s after release and the robot moved for about 2 s.
+
+**Partly fixed (uncommitted, on the board):** every browser command now carries
+a session id and sequence number, and `status_web_server.py`'s `publish_teleop`
+drops anything older than the newest accepted command. After the fix, the robot
+stops about 0.5 s after the last accepted command, roughly the lag plus 0.5 s.
+
+**Still open (held for now):**
+- The stop itself travels over the same laggy link, so it can't arrive sooner than the link allows.
+- Options: (1) lower the twist_mux teleop timeout from 0.5 s to 0.3 s in `config/twist_mux.yaml`, which shortens the tail but leaves less margin for the 200 ms resend; (2) have the browser cancel queued motion requests on release (helps only requests not yet sent).
+- Not yet tested with a real browser over the real Wi-Fi link. The lag test was simulated in software.
+- Change in `web_hmi/status_web_server.py` (sequence check + browser tagging) is uncommitted.
+
 ## 2026-10-02 — Wheel direction invert flipped between two restarts (watch for recurrence)
 
 After the owner rewired the board onto a flat surface, the right wheel

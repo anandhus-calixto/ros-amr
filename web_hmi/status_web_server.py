@@ -62,6 +62,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -76,6 +77,13 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Twi
 from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from action_msgs.msg import GoalStatus, GoalStatusArray
+from action_msgs.srv import CancelGoal
+try:
+    from nav2_msgs.action import NavigateToPose
+    _NAV_FEEDBACK = NavigateToPose.Impl.FeedbackMessage
+except ImportError:  # nav2 not installed - status still works, no distance
+    _NAV_FEEDBACK = None
 
 _LEVEL_NAMES = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
 _VALID_MODES = {"none", "teleop"}  # the only two states the page itself can toggle - see setMode()'s comment
@@ -86,6 +94,42 @@ _MAPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps
 
 def _valid_map_name(name: str) -> bool:
     return bool(name) and len(name) <= 40 and name.replace("_", "").replace("-", "").isalnum()
+
+
+def _valid_waypoint_name(name: str) -> bool:
+    # Looser than a map name (spaces, punctuation are fine - this is a label,
+    # not a filename), just capped and restricted to plain printable ASCII so
+    # it can't do anything odd landing in the JSON file or the page.
+    return bool(name) and len(name) <= 60 and all(32 <= ord(c) < 127 for c in name)
+
+
+def _waypoints_path(map_name: str) -> str:
+    return os.path.join(_MAPS_DIR, map_name + ".waypoints.json")
+
+
+def _load_waypoints(map_name: str) -> list:
+    """Waypoints are saved per-map (2026-10-09) - name, x, y, theta - in
+    maps/<map>.waypoints.json, alongside that map's own .yaml/.pgm, so they
+    are always there whenever that map is loaded, on this robot or a copy of
+    the repo, with no separate setup step."""
+    path = _waypoints_path(map_name)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_waypoints(map_name: str, waypoints: list):
+    os.makedirs(_MAPS_DIR, exist_ok=True)
+    path = _waypoints_path(map_name)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(waypoints, f, indent=2)
+    os.replace(tmp, path)  # atomic - a reader never sees a half-written file
 
 
 def _list_maps():
@@ -177,6 +221,121 @@ _latest_scan = {"received": False}
 # mismatch hit earlier with cmd_vel_teleop/cmd_vel_remote - topic name
 # alone isn't enough, the whole profile has to be compatible).
 _SCAN_QOS = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+# Navigation goal status (2026-10-08), from bt_navigator's own action
+# status topic - so it covers goals sent from anywhere (this page, RViz,
+# the CLI), not just the ones this page published.
+_goal_lock = threading.Lock()
+_latest_goal = {"received": False}
+_GOAL_STATUS_NAMES = {
+    GoalStatus.STATUS_UNKNOWN: "unknown",
+    GoalStatus.STATUS_ACCEPTED: "accepted",
+    GoalStatus.STATUS_EXECUTING: "executing",
+    GoalStatus.STATUS_CANCELING: "canceling",
+    GoalStatus.STATUS_SUCCEEDED: "succeeded",
+    GoalStatus.STATUS_CANCELED: "canceled",
+    GoalStatus.STATUS_ABORTED: "aborted",
+}
+
+# Waypoint loop (2026-10-09). Deliberately NOT nav2's own waypoint_follower
+# node - that would mean adding and lifecycle-managing a ninth process on a
+# board that is already tight on CPU for navigation (see PENDING_ISSUES.md).
+# Instead this reuses what already exists: publish_goal() over /goal_pose,
+# and the goal-status tracking above. One failed/aborted waypoint stops the
+# whole loop rather than ploughing on to the next one - safer default for
+# something meant to run unattended.
+_loop_lock = threading.Lock()
+_loop_stop = threading.Event()
+_loop_state = {"running": False, "detail": "idle"}
+
+
+def _loop_wait_for_goal(prev_id, stop_event, start_timeout=5.0, finish_timeout=180.0):
+    """Blocks until the goal just published (not `prev_id`) settles. There is
+    no goal handle to wait on directly - goals here go through bt_navigator's
+    own internal action client via the /goal_pose topic, not an action client
+    this process holds - so this detects the new goal by watching
+    _latest_goal's id change, then polls its status."""
+    t0 = time.monotonic()
+    gid = None
+    while time.monotonic() - t0 < start_timeout:
+        if stop_event.is_set():
+            return "stopped"
+        with _goal_lock:
+            cur = _latest_goal.get("id")
+        if cur and cur != prev_id:
+            gid = cur
+            break
+        time.sleep(0.2)
+    if gid is None:
+        return "not_accepted"
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < finish_timeout:
+        if stop_event.is_set():
+            return "stopped"
+        with _goal_lock:
+            if _latest_goal.get("id") != gid:
+                return "superseded"  # something else sent a goal mid-loop
+            status_name = _latest_goal.get("status_name")
+        if status_name in ("succeeded", "aborted", "canceled"):
+            return status_name
+        time.sleep(0.3)
+    return "timeout"
+
+
+def _run_loop(hmi_node, map_name, names, repeat):
+    all_wps = {w["name"]: w for w in _load_waypoints(map_name)}
+    seq = [all_wps[n] for n in names if n in all_wps]
+    cycle = 0
+    detail = "no matching waypoints"
+    while seq and not _loop_stop.is_set() and (repeat <= 0 or cycle < repeat):
+        failed = False
+        for wp in seq:
+            if _loop_stop.is_set():
+                detail = "stopped by user"
+                failed = True
+                break
+            with _loop_lock:
+                _loop_state.update({"running": True, "cycle": cycle + 1,
+                                     "total_cycles": repeat if repeat > 0 else None,
+                                     "waypoint": wp["name"], "detail": "navigating"})
+            with _goal_lock:
+                prev_id = _latest_goal.get("id")
+            hmi_node.publish_goal(wp["x"], wp["y"], wp["theta"])
+            result = _loop_wait_for_goal(prev_id, _loop_stop)
+            if result == "stopped":
+                detail = "stopped by user"
+                failed = True
+                break
+            if result != "succeeded":
+                detail = f"'{wp['name']}' {result} - loop stopped"
+                hmi_node.cancel_navigation()
+                failed = True
+                break
+        if failed:
+            break
+        cycle += 1
+        detail = (f"completed {cycle} cycle(s)" if repeat <= 0
+                  else f"completed {cycle}/{repeat} cycle(s)")
+    with _loop_lock:
+        _loop_state.update({"running": False, "detail": detail, "waypoint": None})
+
+
+def _start_loop(hmi_node, map_name, names, repeat):
+    with _loop_lock:
+        if _loop_state.get("running"):
+            return False, "a loop is already running - stop it first"
+    if not names:
+        return False, "select at least one waypoint"
+    _loop_stop.clear()
+    threading.Thread(target=_run_loop, args=(hmi_node, map_name, names, repeat),
+                      daemon=True).start()
+    return True, "loop started"
+
+
+def _stop_loop():
+    with _loop_lock:
+        was_running = _loop_state.get("running")
+    _loop_stop.set()
+    return True, "stopping..." if was_running else "no loop was running"
 _live_map_lock = threading.Lock()
 _latest_live_map = None  # latest /map from SLAM, already in PGM pixel values, rows top-first
 
@@ -200,9 +359,24 @@ class HmiNode(Node):
         self.create_subscription(String, "/hmi/cmd_vel_active_source", self._on_active, _LATCHED_QOS)
         self.create_subscription(Odometry, "/diffbot_base_controller/odom", self._on_odom, 10)
         self.create_subscription(LaserScan, "/scan_filtered", self._on_scan, _SCAN_QOS)
+        self._last_scan_build = 0.0  # throttle gate - see _on_scan()
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._map_to_odom = None
+        self.create_timer(0.2, self._refresh_map_to_odom)  # 5Hz - see get_map_to_odom()
         self.create_subscription(OccupancyGrid, "/map", self._on_map, 1)
+        # Action status is published TRANSIENT_LOCAL by the action server, so a
+        # latched subscription also gets the current state on connect.
+        self.create_subscription(GoalStatusArray, "/navigate_to_pose/_action/status",
+                                 self._on_goal_status, _LATCHED_QOS)
+        if _NAV_FEEDBACK is not None:
+            self.create_subscription(_NAV_FEEDBACK, "/navigate_to_pose/_action/feedback",
+                                     self._on_goal_feedback, 10)
+        # Goal cancellation (2026-10-09). A plain service client, not an
+        # action client - this process never holds the goal handle (goals go
+        # out via /goal_pose, not an action request from here), so it uses
+        # the raw CancelGoal service every ROS2 action server exposes.
+        self._cancel_client = self.create_client(CancelGoal, "/navigate_to_pose/_action/cancel_goal")
         self._mode_pub = self.create_publisher(String, "/hmi/cmd_vel_mode", _LATCHED_QOS)
         self._goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
@@ -266,22 +440,37 @@ class HmiNode(Node):
             _latest_pose.clear()
             _latest_pose.update(data)
 
-    def get_map_to_odom(self):
-        """The correction AMCL produces once localized - None before that. Composed
-        onto the odom-frame pose (see pollPose() in the page) so the robot, its
-        outline, and the scan all draw aligned with the saved map's own frame."""
+    def _refresh_map_to_odom(self):
+        """Timer callback (2026-10-09, 5Hz) - looks the transform up ONCE here
+        regardless of how many browser tabs are polling /pose.json or how
+        often, instead of doing a fresh tf2 lookup per HTTP request."""
         try:
             t = self._tf_buffer.lookup_transform("map", "odom", Time())
         except (LookupException, ConnectivityException, ExtrapolationException):
-            return None
+            self._map_to_odom = None
+            return
         q = t.transform.rotation
-        return {
+        self._map_to_odom = {
             "x": t.transform.translation.x,
             "y": t.transform.translation.y,
             "theta": 2.0 * math.atan2(q.z, q.w),
         }
 
+    def get_map_to_odom(self):
+        """The correction AMCL produces once localized - None before that. Composed
+        onto the odom-frame pose (see pollPose() in the page) so the robot, its
+        outline, and the scan all draw aligned with the saved map's own frame."""
+        return self._map_to_odom
+
     def _on_scan(self, msg: LaserScan):
+        # 2026-10-09: throttled to ~5Hz (matches the page's pollScan
+        # interval) instead of doing this ~1000-point Python loop at the
+        # LiDAR's full ~15Hz publish rate regardless of whether anyone is
+        # looking at it.
+        now = time.monotonic()
+        if now - self._last_scan_build < 0.18:
+            return
+        self._last_scan_build = now
         # Ranges only, rounded - angle_min/increment let the browser derive
         # each point's angle itself rather than sending it per-point. inf/nan
         # (no return) become null so the client can skip them cheaply.
@@ -342,6 +531,42 @@ class HmiNode(Node):
         self._initial_pose_pub.publish(msg)
         self.get_logger().info(f"Published /initialpose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
 
+    def _on_goal_status(self, msg: GoalStatusArray):
+        if not msg.status_list:
+            return
+        # The list keeps finished goals around for a while; the newest-accepted
+        # one is the goal the robot is (or was last) working on.
+        st = max(msg.status_list,
+                 key=lambda s: s.goal_info.stamp.sec + s.goal_info.stamp.nanosec * 1e-9)
+        gid = bytes(st.goal_info.goal_id.uuid).hex()
+        now = self.get_clock().now().nanoseconds * 1e-9
+        with _goal_lock:
+            prev = _latest_goal.get("id")
+            if prev != gid:
+                # new goal - drop the previous goal's feedback numbers
+                for k in ("distance_remaining", "recoveries", "nav_time"):
+                    _latest_goal.pop(k, None)
+                _latest_goal["accepted_at"] = (st.goal_info.stamp.sec
+                                                + st.goal_info.stamp.nanosec * 1e-9)
+            if _latest_goal.get("status") != st.status:
+                _latest_goal["changed_at"] = now
+            _latest_goal.update({
+                "received": True,
+                "id": gid,
+                "status": int(st.status),
+                "status_name": _GOAL_STATUS_NAMES.get(st.status, str(st.status)),
+            })
+
+    def _on_goal_feedback(self, msg):
+        fb = msg.feedback
+        with _goal_lock:
+            if bytes(msg.goal_id.uuid).hex() != _latest_goal.get("id"):
+                return
+            _latest_goal["distance_remaining"] = round(float(fb.distance_remaining), 2)
+            _latest_goal["recoveries"] = int(fb.number_of_recoveries)
+            _latest_goal["nav_time"] = round(fb.navigation_time.sec
+                                             + fb.navigation_time.nanosec * 1e-9, 1)
+
     def publish_goal(self, x: float, y: float, theta: float):
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -352,6 +577,16 @@ class HmiNode(Node):
         msg.pose.orientation.w = math.cos(theta / 2.0)
         self._goal_pub.publish(msg)
         self.get_logger().info(f"Published /goal_pose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
+
+    def cancel_navigation(self) -> bool:
+        """Cancels whatever nav2 goal is in flight right now, however it was
+        sent - this page, RViz, the CLI. A CancelGoal.Request with its
+        all-zero default goal_id and zero stamp is the ROS2 action protocol's
+        "cancel every goal on this server" form."""
+        if not self._cancel_client.service_is_ready():
+            return False
+        self._cancel_client.call_async(CancelGoal.Request())
+        return True
 
     def publish_teleop(self, linear: float, angular: float, session=None, seq=None):
         # Commands from the browser carry a per-page session id and an
@@ -465,6 +700,14 @@ HTML_PAGE = """<!doctype html>
   }
   button:hover { background: #eceef1; }
   button.active { border-color: #2f6fed; color: #2f6fed; background: #eaf1fe; }
+  button.danger { border-color: #c0392b; color: #c0392b; background: #fde8e8; }
+  button.danger:hover { background: #fbd4d4; }
+  fieldset.wp-box { border: 1px solid #d8dbe0; border-radius: 8px; padding: 0.6rem 0.7rem; margin-top: 0.6rem; }
+  fieldset.wp-box legend { font-size: 0.8rem; color: #6b7280; padding: 0 0.3rem; }
+  .wp-list { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.4rem 0; }
+  .wp-row { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+  .wp-row .wp-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wp-row button { padding: 0.2rem 0.5rem; font-size: 0.78rem; }
   .estop-btn {
     width: 100%; padding: 0.9rem; font-size: 1.1rem; font-weight: 700; letter-spacing: 0.03em;
     border-radius: 10px; border: 2px solid #b91c1c; background: #dc2626; color: #fff;
@@ -577,15 +820,38 @@ HTML_PAGE = """<!doctype html>
           <div class="modes">
             <button id="nav-start-btn">Start navigation</button>
             <button id="nav-stop-btn">Stop navigation</button>
+            <button id="nav-restart-btn" title="Stops and starts nav2 again with the selected map - use this if it has frozen or stopped responding to goals.">Restart navigation</button>
           </div>
           <div class="modes">
             <button id="nav-pose-mode-btn">Set initial pose</button>
           </div>
           <div class="hint">Click and drag on the map to set a goal. Drag direction sets heading.
           While "Set initial pose" is on, the next drag sets the robot's starting pose instead.</div>
+          <div class="modes">
+            <button id="nav-cancel-btn" class="danger" title="Cancels whatever goal nav2 is currently working on - use this before a restart if a goal has gone wrong.">Cancel goal</button>
+          </div>
           <div id="nav-status" class="hint"></div>
+          <div><span id="goal-status" class="badge unknown">Goal: none yet</span></div>
         </div>
-        <div class="hint">Waypoints: coming next.</div>
+
+        <fieldset class="wp-box">
+          <legend>Waypoints &amp; loop</legend>
+          <div class="modes">
+            <button id="wp-add-btn">Add waypoint</button>
+          </div>
+          <div class="hint">Saved per map. "Add waypoint" then click-and-drag on the map like
+          setting a goal - you'll be asked for a name. Tick the ones to include in a loop.</div>
+          <div id="wp-list" class="wp-list"></div>
+          <div class="modes">
+            <label>Repeat <input id="loop-repeat" type="number" min="0" step="1" value="0" style="width:3.5em"></label>
+            <span class="hint" style="margin:0">(0 = run forever)</span>
+          </div>
+          <div class="modes">
+            <button id="loop-start-btn">Start loop</button>
+            <button id="loop-stop-btn" class="danger">Stop loop</button>
+          </div>
+          <div id="loop-status" class="hint">Loop: idle</div>
+        </fieldset>
       </section>
     </aside>
 
@@ -1302,7 +1568,7 @@ function drawMap() {
 }
 
 document.getElementById('map-select').addEventListener('change', (e) => showMap(e.target.value));
-document.getElementById('nav-map-select').addEventListener('change', (e) => showMap(e.target.value));
+document.getElementById('nav-map-select').addEventListener('change', (e) => { showMap(e.target.value); loadWaypoints(); });
 fetch('/maps.json').then(r => r.json()).then(d => {
   const sel = document.getElementById('map-select');
   const navSel = document.getElementById('nav-map-select');
@@ -1315,7 +1581,7 @@ fetch('/maps.json').then(r => r.json()).then(d => {
   }
 }).catch(() => {});
 
-let canvasClickMode = 'goal';  // 'goal' or 'initialpose' - toggled by nav-pose-mode-btn
+let canvasClickMode = 'goal';  // 'goal', 'initialpose' or 'waypoint' - see the mode buttons below
 document.getElementById('nav-pose-mode-btn').addEventListener('click', (e) => {
   canvasClickMode = canvasClickMode === 'goal' ? 'initialpose' : 'goal';
   e.target.classList.toggle('active', canvasClickMode === 'initialpose');
@@ -1342,6 +1608,14 @@ document.getElementById('nav-start-btn').addEventListener('click', () => {
   sendNavigation('start');
 });
 document.getElementById('nav-stop-btn').addEventListener('click', () => sendNavigation('stop'));
+document.getElementById('nav-restart-btn').addEventListener('click', () => {
+  if (!document.getElementById('nav-map-select').value) {
+    document.getElementById('nav-status').textContent = 'Choose a map first.';
+    return;
+  }
+  document.getElementById('nav-status').textContent = 'Restarting navigation - set the initial pose again once it is back up...';
+  sendNavigation('restart');
+});
 
 // Robot footprint, from calixto-ros-bot.md: length 780 mm, width 480 mm.
 // LiDAR: 80 mm behind the front edge, centred side to side -> 390 - 80 = 310 mm forward of centre.
@@ -1508,8 +1782,33 @@ async function publishGoalFromDrag(d) {
   // the goal's current heading (0).
   const theta = dragDist > 8 ? Math.atan2(-dx, -dy) : 0;
   const isPose = canvasClickMode === 'initialpose';
-  const url = isPose ? '/initial_pose' : '/goal';
+  const isWaypoint = canvasClickMode === 'waypoint';
   const status = document.getElementById('nav-status');
+  if (isWaypoint) {
+    // One-shot, same pattern as initial-pose mode below.
+    canvasClickMode = 'goal';
+    const btn = document.getElementById('wp-add-btn');
+    btn.classList.remove('active');
+    btn.textContent = 'Add waypoint';
+    const name = prompt('Name this waypoint:');
+    if (!name) { status.textContent = 'Waypoint not saved (no name given).'; return; }
+    const map = document.getElementById('nav-map-select').value;
+    try {
+      const res = await fetch('/waypoints', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'add', map, name, x: gx, y: gy, theta })
+      });
+      const data = await res.json();
+      status.textContent = data.status === 'ok'
+        ? `Waypoint "${name}" saved at x=${gx.toFixed(2)} y=${gy.toFixed(2)}.`
+        : (data.detail || 'Could not save the waypoint.');
+    } catch (e) {
+      status.textContent = 'Failed to reach the server.';
+    }
+    loadWaypoints();
+    return;
+  }
+  const url = isPose ? '/initial_pose' : '/goal';
   const body = JSON.stringify({ x: gx, y: gy, theta: theta });
   if (isPose) {
     // Resending is safe here: AMCL just takes the latest estimate, it does not
@@ -1525,16 +1824,16 @@ async function publishGoalFromDrag(d) {
     // would cancel and restart navigation repeatedly instead of helping it.
     try { await fetch(url, { method: 'POST', body }); } catch (e) { /* best-effort */ }
   }
+  // 2026-10-09: pose mode used to be one-shot (reverted to 'goal' right
+  // after sending), which silently turned a SECOND drag - meant to nudge or
+  // retry the pose - into a navigation goal instead, with no error and no
+  // visible sign anything was wrong. Pose mode now stays sticky until the
+  // "Set initial pose" button is clicked again to turn it off, so you can
+  // re-drag as many times as needed (e.g. while watching AMCL converge)
+  // without it silently switching back to sending goals underneath you.
   status.textContent = isPose
-    ? `Initial pose sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}. Check "Pose:" above says "localized".`
+    ? `Initial pose sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}. Check "Pose:" above says "localized". Still in pose mode - drag again to adjust, or click "Set initial pose" to turn it off.`
     : `Goal sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}.`;
-  if (isPose) {
-    // One-shot: back to goal mode so a stray drag can't send another pose.
-    canvasClickMode = 'goal';
-    const btn = document.getElementById('nav-pose-mode-btn');
-    btn.classList.remove('active');
-    btn.textContent = 'Set initial pose';
-  }
 }
 
 window.addEventListener('mouseup', (evt) => {
@@ -1688,19 +1987,186 @@ async function pollScan() {
   }
 }
 
+// Goal status (2026-10-08) - from bt_navigator's action status, so it also
+// reflects goals sent from RViz or the CLI, not only from this page.
+const goalBadge = document.getElementById('goal-status');
+const GOAL_LOOK = {
+  accepted:  ['warn',    'Goal accepted'],
+  executing: ['warn',    'Goal: moving'],
+  canceling: ['warn',    'Goal: canceling'],
+  succeeded: ['ok',      'Goal reached \u2713'],
+  canceled:  ['unknown', 'Goal canceled'],
+  aborted:   ['error',   'Goal FAILED \u2717'],
+};
+async function pollGoal() {
+  try {
+    const res = await fetch('/goal_status.json', { cache: 'no-store' });
+    const g = await res.json();
+    if (!g.received) {
+      goalBadge.className = 'badge unknown';
+      goalBadge.textContent = 'Goal: none yet';
+      return;
+    }
+    const [cls, label] = GOAL_LOOK[g.status_name] || ['unknown', 'Goal: ' + g.status_name];
+    let text = label;
+    if (g.status_name === 'executing' && g.distance_remaining != null) {
+      text += ` \u2014 ${g.distance_remaining.toFixed(2)} m left`;
+    }
+    if ((g.status_name === 'succeeded' || g.status_name === 'aborted') && g.nav_time != null) {
+      text += ` in ${g.nav_time.toFixed(1)} s`;
+    }
+    if (g.recoveries) {
+      text += ` (${g.recoveries} recover${g.recoveries === 1 ? 'y' : 'ies'})`;
+    }
+    goalBadge.className = 'badge ' + cls;
+    goalBadge.textContent = text;
+  } catch (e) {
+    goalBadge.className = 'badge unknown';
+    goalBadge.textContent = 'Goal: unknown';
+  }
+}
+
+// --- Cancel goal (2026-10-09) ---
+document.getElementById('nav-cancel-btn').addEventListener('click', async () => {
+  const status = document.getElementById('nav-status');
+  status.textContent = 'Canceling...';
+  try {
+    const res = await fetch('/cancel_goal', { method: 'POST' });
+    const data = await res.json();
+    status.textContent = data.detail || data.status;
+  } catch (e) {
+    status.textContent = 'Failed to reach the server.';
+  }
+});
+
+// --- Waypoints (2026-10-09) ---
+let lastWaypoints = [];
+async function loadWaypoints() {
+  const map = document.getElementById('nav-map-select').value;
+  const list = document.getElementById('wp-list');
+  if (!map) { list.innerHTML = '<div class="hint">Choose a map first.</div>'; lastWaypoints = []; return; }
+  try {
+    const res = await fetch(`/waypoints.json?map=${encodeURIComponent(map)}`, { cache: 'no-store' });
+    const data = await res.json();
+    lastWaypoints = data.waypoints || [];
+    if (!lastWaypoints.length) {
+      list.innerHTML = '<div class="hint">No waypoints saved for this map yet.</div>';
+      return;
+    }
+    list.innerHTML = lastWaypoints.map(w => `
+      <div class="wp-row" data-name="${w.name.replace(/"/g, '&quot;')}">
+        <input type="checkbox" class="wp-select" checked>
+        <span class="wp-name" title="${w.name.replace(/"/g, '&quot;')}">${w.name}</span>
+        <button class="wp-go">Go</button>
+        <button class="wp-del danger">×</button>
+      </div>`).join('');
+    list.querySelectorAll('.wp-go').forEach(btn => btn.addEventListener('click', async (e) => {
+      const row = e.target.closest('.wp-row');
+      const w = lastWaypoints.find(x => x.name === row.dataset.name);
+      if (!w) return;
+      document.getElementById('nav-status').textContent = `Sending goal: ${w.name}`;
+      try {
+        await fetch('/goal', { method: 'POST', body: JSON.stringify({ x: w.x, y: w.y, theta: w.theta }) });
+      } catch (err) { /* best-effort, same as the map-click goal sender */ }
+    }));
+    list.querySelectorAll('.wp-del').forEach(btn => btn.addEventListener('click', async (e) => {
+      const row = e.target.closest('.wp-row');
+      if (!confirm(`Delete waypoint "${row.dataset.name}"?`)) return;
+      await fetch('/waypoints', { method: 'POST', body: JSON.stringify({ action: 'delete', map, name: row.dataset.name }) });
+      loadWaypoints();
+    }));
+  } catch (e) {
+    list.innerHTML = '<div class="hint">Could not load waypoints.</div>';
+  }
+}
+
+document.getElementById('wp-add-btn').addEventListener('click', () => {
+  if (!document.getElementById('nav-map-select').value) {
+    document.getElementById('nav-status').textContent = 'Choose a map first.';
+    return;
+  }
+  canvasClickMode = 'waypoint';
+  const btn = document.getElementById('wp-add-btn');
+  btn.classList.add('active');
+  btn.textContent = 'Click and drag on the map...';
+});
+
+// --- Loop (2026-10-09) ---
+function selectedWaypointNames() {
+  return Array.from(document.querySelectorAll('.wp-row'))
+    .filter(r => r.querySelector('.wp-select').checked)
+    .map(r => r.dataset.name);
+}
+document.getElementById('loop-start-btn').addEventListener('click', async () => {
+  const loopStatus = document.getElementById('loop-status');
+  const map = document.getElementById('nav-map-select').value;
+  const names = selectedWaypointNames();
+  const repeat = parseInt(document.getElementById('loop-repeat').value, 10) || 0;
+  if (!map) { loopStatus.textContent = 'Loop: choose a map first.'; return; }
+  if (!names.length) { loopStatus.textContent = 'Loop: tick at least one waypoint above.'; return; }
+  try {
+    const res = await fetch('/loop', { method: 'POST', body: JSON.stringify({ action: 'start', map, names, repeat }) });
+    const data = await res.json();
+    loopStatus.textContent = 'Loop: ' + (data.detail || data.status);
+  } catch (e) {
+    loopStatus.textContent = 'Loop: failed to reach the server.';
+  }
+});
+document.getElementById('loop-stop-btn').addEventListener('click', async () => {
+  const loopStatus = document.getElementById('loop-status');
+  try {
+    const res = await fetch('/loop', { method: 'POST', body: JSON.stringify({ action: 'stop' }) });
+    const data = await res.json();
+    loopStatus.textContent = 'Loop: ' + (data.detail || data.status);
+  } catch (e) {
+    loopStatus.textContent = 'Loop: failed to reach the server.';
+  }
+});
+async function pollLoop() {
+  try {
+    const res = await fetch('/loop_status.json', { cache: 'no-store' });
+    const s = await res.json();
+    const el = document.getElementById('loop-status');
+    if (s.running) {
+      const cyc = s.total_cycles ? `${s.cycle}/${s.total_cycles}` : `${s.cycle}`;
+      el.textContent = `Loop: running - cycle ${cyc}, waypoint "${s.waypoint}" (${s.detail})`;
+    } else {
+      el.textContent = 'Loop: ' + (s.detail || 'idle');
+    }
+  } catch (e) { /* ignore - next poll will retry */ }
+}
+
 pollStatus();
 pollPose();
 pollScan();
+pollGoal();
+loadWaypoints();
+pollLoop();
 setInterval(pollStatus, 500);
 setInterval(pollPose, 150);
 setInterval(pollScan, 200);
+setInterval(pollGoal, 500);
+setInterval(pollLoop, 1000);
 </script>
 </body>
 </html>
 """
 
 
+# 2026-10-09: HTTP/1.0 -> 1.1 on the handler below. Default BaseHTTPRequestHandler
+# protocol is HTTP/1.0, which closes the TCP connection after every single
+# response. The page polls ~14-17 times/sec from one tab (pose 150ms, scan
+# 200ms, status+goal 500ms, loop 1s) - that was ~14-17 fresh TCP handshakes
+# AND ~14-17 new OS threads/sec (ThreadingHTTPServer spawns one thread per
+# CONNECTION, which under HTTP/1.0 means per request) on a board that is
+# already short on CPU headroom during navigation. HTTP/1.1 lets fetch()
+# reuse one connection for all of a tab's polling instead. Safe to turn on
+# because every response here sets Content-Length explicitly (checked
+# 2026-10-09 - a response with no Content-Length under keep-alive leaves the
+# client hanging, waiting for a body that is never coming).
 class HmiHTTPHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         pass  # keep the console quiet - this is a status page, not a web server demo
 
@@ -1732,6 +2198,10 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             with _scan_lock:
                 data = dict(_latest_scan)
             self._send_json(data)
+        elif self.path == "/goal_status.json":
+            with _goal_lock:
+                data = dict(_latest_goal)
+            self._send_json(data)
         elif self.path == "/speed.json":
             lin, ang = self.server.hmi_node.speed_limits
             self._send_json({"linear": lin, "angular": ang})
@@ -1748,6 +2218,17 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                                      "height": m["height"], "resolution": m["resolution"],
                                      "origin": m["origin"],
                                      "data": base64.b64encode(m["data"]).decode("ascii")})
+        elif self.path.startswith("/waypoints.json"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = query.get("map", [""])[0]
+            if not _valid_map_name(name):
+                self._send_json({"status": "error", "detail": "unknown map"}, status=404)
+                return
+            self._send_json({"waypoints": _load_waypoints(name)})
+        elif self.path == "/loop_status.json":
+            with _loop_lock:
+                data = dict(_loop_state)
+            self._send_json(data)
         elif self.path == "/maps.json":
             self._send_json({"maps": _list_maps()})
         elif self.path.startswith("/map.json"):
@@ -1764,6 +2245,7 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             fpath = os.path.join(_ASSETS_DIR, os.path.basename(self.path))
             if not os.path.isfile(fpath):
                 self.send_response(404)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             with open(fpath, "rb") as f:
@@ -1782,6 +2264,7 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_POST(self):
@@ -1804,6 +2287,68 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 return
             self.server.hmi_node.publish_goal(x, y, theta)
             self._send_json({"status": "ok"})
+        elif self.path == "/cancel_goal":
+            ok = self.server.hmi_node.cancel_navigation()
+            self._send_json({"status": "ok" if ok else "error",
+                              "detail": "cancel sent" if ok else
+                                        "nav2's action server is not up (is navigation running?)"},
+                             status=200 if ok else 503)
+        elif self.path == "/waypoints":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                action, map_name, name = data["action"], data["map"], data.get("name", "")
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad waypoint payload: {e}"}, status=400)
+                return
+            if not _valid_map_name(map_name):
+                self._send_json({"status": "error", "detail": "unknown map"}, status=400)
+                return
+            waypoints = _load_waypoints(map_name)
+            if action == "add":
+                if not _valid_waypoint_name(name):
+                    self._send_json({"status": "error",
+                                      "detail": "name: 1-60 plain characters"}, status=400)
+                    return
+                try:
+                    x, y, theta = float(data["x"]), float(data["y"]), float(data["theta"])
+                except (KeyError, ValueError, TypeError):
+                    self._send_json({"status": "error", "detail": "bad x/y/theta"}, status=400)
+                    return
+                waypoints = [w for w in waypoints if w["name"] != name]  # upsert by name
+                waypoints.append({"name": name, "x": x, "y": y, "theta": theta})
+                _save_waypoints(map_name, waypoints)
+                self._send_json({"status": "ok"})
+            elif action == "delete":
+                kept = [w for w in waypoints if w["name"] != name]
+                _save_waypoints(map_name, kept)
+                self._send_json({"status": "ok", "deleted": len(waypoints) != len(kept)})
+            else:
+                self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
+        elif self.path == "/loop":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                action = data["action"]
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad loop payload: {e}"}, status=400)
+                return
+            if action == "start":
+                map_name = data.get("map", "")
+                names = data.get("names") or []
+                try:
+                    repeat = int(data.get("repeat", 0))
+                except (TypeError, ValueError):
+                    repeat = 0
+                if not _valid_map_name(map_name):
+                    self._send_json({"status": "error", "detail": "choose a map first"}, status=400)
+                    return
+                ok, detail = _start_loop(self.server.hmi_node, map_name, names, repeat)
+                self._send_json({"status": "ok" if ok else "error", "detail": detail},
+                                 status=200 if ok else 400)
+            elif action == "stop":
+                ok, detail = _stop_loop()
+                self._send_json({"status": "ok", "detail": detail})
+            else:
+                self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
         elif self.path == "/initial_pose":
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -1829,6 +2374,24 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 cmd = ["bash", f"{docker_dir}/start_navigation.sh", map_name]
             elif action == "stop":
                 cmd = ["bash", f"{docker_dir}/stop_navigation.sh"]
+            elif action == "restart":
+                # 2026-10-08: nav2 occasionally wedges (most often the
+                # planner_server/AMCL bringup deadlock documented in
+                # PENDING_ISSUES.md - stuck until an initial pose arrives, or
+                # a stale PID file left over from an unclean stop). Until now
+                # that meant asking someone with SSH to run stop+start by
+                # hand every time. Same two scripts, run back to back -
+                # stop_navigation.sh is safe to call even if nothing is
+                # running (see its own header comment).
+                if not _valid_map_name(map_name):
+                    self._send_json({"status": "error", "detail": "choose a map first"}, status=400)
+                    return
+                try:
+                    subprocess.run(["bash", f"{docker_dir}/stop_navigation.sh"],
+                                    capture_output=True, text=True, timeout=20)
+                except subprocess.TimeoutExpired:
+                    pass  # best-effort - start_navigation.sh will still refuse on a stale PID file
+                cmd = ["bash", f"{docker_dir}/start_navigation.sh", map_name]
             else:
                 self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
                 return
@@ -1898,6 +2461,7 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok"})
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
 

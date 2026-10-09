@@ -160,12 +160,24 @@ controller_server:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      # 2026-10-09: 0.25 -> 0.15 rad (~14 deg -> ~8.6 deg). 0.25 let the goal
+      # count as "reached" well before the robot was actually pointing where
+      # the goal arrow was dragged - that is the "orientation not followed"
+      # symptom, not a control problem.
+      yaw_goal_tolerance: 0.15
 
     FollowPath:
       # ----- RotationShim wrapping DWB -----
       plugin: "nav2_rotation_shim_controller::RotationShimController"
       primary_controller: "dwb_core::DWBLocalPlanner"
+      # 2026-10-09: False -> True. With this False, the final turn onto the
+      # goal heading was done by DWB's RotateToGoal critic BLENDED with
+      # GoalAlign/PathDist/GoalDist every cycle - that optimisation hunts
+      # between "rotate" and "creep forward a bit" each 50ms tick, which is
+      # the goal-reach "dance". True hands the final turn to the shim itself:
+      # a plain in-place spin at rotate_to_heading_angular_vel, nothing else
+      # competing, done once xy_goal_tolerance is met.
+      rotate_to_goal_heading: True
       angular_dist_threshold: 0.785          # engage shim above ~45 deg
       # angular_disengage_threshold: 1.2     # UNCOMMENT if on Nav2 Iron or later (adds hysteresis)
       # 2026-10-08 step1: back to 0.5. A goal behind the robot and closer than
@@ -191,8 +203,8 @@ controller_server:
       # 1.3 because of the ramp problem fixed below; once that is fixed it WILL
       # reach whatever is set here. Start at 0.8, raise only after the turn is
       # smooth and the scan stays on the map.
-      # 2026-10-08 (jitter): 0.8 -> 0.6
-      rotate_to_heading_angular_vel: 0.6
+      # 2026-10-08 (jitter): 0.8 -> 0.6 -> 0.8
+      rotate_to_heading_angular_vel: 0.8
       # 2026-10-08 step1: ramp fix (was max_angular_accel: 1.3, closed_loop
       # unset). By default the shim limits each command to
       #   measured angular velocity +/- max_angular_accel * 0.05 s
@@ -218,17 +230,23 @@ controller_server:
       simulate_ahead_time: 1.0
 
       # ----- DWB primary controller -----
-      debug_trajectory_details: True
+      # 2026-10-08: True -> False. It publishes every evaluated trajectory for
+      # visualisation - pure CPU overhead, and the controller was still missing
+      # its 20 Hz deadline (up to 50% of cycles) during goals.
+      debug_trajectory_details: False
       min_vel_x: 0.0
       min_vel_y: 0.0
-      # 2026-10-08: 0.15 -> 0.20 -> 0.30
-      max_vel_x: 0.30
+      # 2026-10-08: 0.15 -> 0.20 -> 0.30 -> 0.40
+      max_vel_x: 0.40
       max_vel_y: 0.0
-      # 2026-10-08 (jitter): 0.9 -> 0.5
-      max_vel_theta: 0.5
+      # 2026-10-08 (jitter): 0.9 -> 0.5 -> 0.8. Lowered to fight weaving, but
+      # the real cause was forward_point_distance 0.1 (now 0.325). With
+      # max_vel_x at 0.30 the robot cornered ~2.5x wider than originally
+      # (0.60 m radius at full speed); 0.8 brings it to 0.375 m.
+      max_vel_theta: 0.8
       min_speed_xy: 0.0
-      max_speed_xy: 0.30
-      min_speed_theta: 0.001  # linear capped at 0.30 m/s, angular at 0.5 rad/s                 # was 0.4 — that value broke stopped-detection
+      max_speed_xy: 0.40
+      min_speed_theta: 0.001  # linear capped at 0.40 m/s, angular at 0.8 rad/s                 # was 0.4 — that value broke stopped-detection
       acc_lim_x: 1.0
       acc_lim_y: 0.0
       # 2026-10-08 (jitter): 1.3 -> 0.8, decel matched at -0.8 (was -1.0).
@@ -237,7 +255,9 @@ controller_server:
       decel_lim_x: -1.0
       decel_lim_y: 0.0
       decel_lim_theta: -0.8
-      vx_samples: 20
+      # 2026-10-08: 20 -> 12. 20 linear samples is far more than a 0.3 m/s
+      # robot needs; trajectories per cycle 480 -> 288.
+      vx_samples: 12
       vy_samples: 5
       # 2026-10-08: 20 -> 40 -> 24. 40 with sim_time 2.0 was ~4x the original
       # trajectory work per cycle and the i.MX8MP could not finish inside the

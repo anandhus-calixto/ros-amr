@@ -121,9 +121,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "params_file",
             default_value=PathJoinSubstitution(
-                [FindPackageShare("calixto-ros-bot"), "config", "nav2_params.yaml"]
+                [FindPackageShare("calixto-ros-bot"), "config", "nav2_params_step1.yaml"]
             ),
-            description="Nav2 parameter file.",
+            # 2026-10-08: default moved to step1 to match docker/start_navigation.sh.
+            description="Nav2 parameter file. Defaults to nav2_params_step1.yaml.",
         ),
         DeclareLaunchArgument(
             "use_sim_time",

@@ -22,9 +22,15 @@ PIDFILE=/tmp/navigation.pids
 MAPS=/ros2_ws/src/ros-amr/maps
 # 2026-10-08: optional 2nd argument picks the params file, so step1/step2
 # tuning variants can be tried without overwriting nav2_params.yaml. Name only
-# (no .yaml, no path) - it is resolved against config/. Defaults to the
-# baseline nav2_params.yaml when omitted, exactly as before.
-PARAMS_NAME="${2:-nav2_params}"
+# (no .yaml, no path) - it is resolved against config/.
+# Default is nav2_params_step1 (2026-10-08), NOT the old baseline: the web
+# UI's "Start navigation" button calls this script with the map name only, so
+# whatever is defaulted here is what the button runs. step1 carries the day's
+# tuning (0.40 m/s, rotate-in-place + rotate-to-goal, the forward_point_distance
+# weaving fix, CPU-sized sampling). Pass nav2_params to get the old baseline.
+# step3 (Hybrid planner) was tried and rejected the same day: forward-only
+# curves need room for a U-turn, and 52 planner failures in one session.
+PARAMS_NAME="${2:-nav2_params_step1}"
 PARAMS="/ros2_ws/src/ros-amr/config/${PARAMS_NAME}.yaml"
 MAP_NAME="${1:?usage: start_navigation.sh <map_name> [params_name]}"
 

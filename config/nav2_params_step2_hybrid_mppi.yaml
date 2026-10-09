@@ -164,9 +164,14 @@ controller_server:
       plugin: "nav2_mppi_controller::MPPIController"
 
       # --- horizon: 70 steps * 0.05 s = 3.5 s, about 0.5 m at 0.15 m/s ---
-      time_steps: 70
+      # 2026-10-08: 70 -> 40 (horizon 3.5 s -> 2.0 s = 0.8 m at 0.40 m/s).
+      # Sized for the i.MX8MP's 4x Cortex-A53: DWB at only 288 trajectories
+      # per cycle was already missing its 20 Hz deadline ~38x per goal.
+      time_steps: 40
       model_dt: 0.05              # keep equal to 1 / controller_frequency
-      batch_size: 2000            # lower to 1000 if controller_server misses its rate
+      # 2026-10-08: 2000 -> 800 (see time_steps). Raise only if the controller
+      # log shows no "missed its desired rate" warnings during goals.
+      batch_size: 800
       iteration_count: 1
       prune_distance: 1.0         # must stay longer than the horizon distance
       transform_tolerance: 1.0
@@ -178,8 +183,13 @@ controller_server:
       regenerate_noises: false
 
       # --- velocity limits (same caps as the old DWB setup) ---
-      vx_max: 0.15
-      vx_min: -0.10               # negative = reversing allowed. Set 0.0 to forbid it.
+      # 2026-10-08: speeds matched to nav2_params_step1.yaml (max_vel_x 0.40,
+      # max_vel_theta 0.8, acc_lim_x 1.0, acc_lim_theta 0.8, forward only).
+      vx_max: 0.40
+      # 2026-10-08: -0.10 -> 0.0, forward only like step1. Reversing is also
+      # the riskiest direction here: the 25% body filter leaves ~10 cm
+      # behind the robot unseen, so only the bumper covers it.
+      vx_min: 0.0
       vy_max: 0.0
       wz_max: 0.8
       # how widely MPPI explores around its current plan
@@ -189,11 +199,11 @@ controller_server:
       # acceleration limits (newer builds); velocity_smoother enforces them anyway
       ax_max: 1.0
       ax_min: -1.0
-      az_max: 1.3
+      az_max: 0.8                 # 2026-10-08: 1.3 -> 0.8, = step1 acc_lim_theta
 
       # Stop at forward/reverse switch points in the plan instead of cutting
       # across them (newer builds).
-      enforce_path_inversion: true
+      enforce_path_inversion: false   # 2026-10-08: no reverse segments with DUBIN
       inversion_xy_tolerance: 0.2
       inversion_yaw_tolerance: 0.4
 
@@ -384,7 +394,8 @@ planner_server:
       max_iterations: 1000000
       max_on_approach_iterations: 1000
       max_planning_time: 5.0
-      motion_model_for_search: "REEDS_SHEPP"   # forward AND reverse. "DUBIN" = forward only
+      # 2026-10-08: REEDS_SHEPP -> DUBIN (forward only), to match MPPI vx_min 0.0.
+      motion_model_for_search: "DUBIN"
       angle_quantization_bins: 72              # 5 degree heading steps
       analytic_expansion_ratio: 3.5
       analytic_expansion_max_length: 3.0

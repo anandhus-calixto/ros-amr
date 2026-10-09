@@ -2,6 +2,102 @@
 
 Running list of known gaps/temporary fixes that need real follow-up. Newest on top.
 
+## 2026-10-09 — CPU optimization backlog: IMU-to-MCU, costmap update rates
+
+Found while chasing the goal-reach stutter (same day as the web_hmi keep-alive
+fix). Neither of these is applied yet - both need either hardware/firmware
+work outside this repo, or a deliberate decision about obstacle-avoidance
+behaviour, so they are left here to revisit rather than rushed in.
+
+### 1. Move the BNO055 IMU off the i.MX8MP, onto the motor-control MCU
+
+Measured 2026-10-09: the `bno055` driver node costs 36.7% of one core on its
+own - ~9.2% of the i.MX8MP's total 4-core capacity, the single biggest
+consumer after the web UI. It is NOT doing fusion math - the BNO055 chip has
+its own onboard Cortex-M0 and computes the orientation quaternion itself. The
+i.MX8MP's cost is pure driver overhead: polling I2C and publishing a ROS
+message at ~65 Hz, when EKF (the only consumer) only runs its filter at 10 Hz.
+
+The motor driver is already CANopen-profile controlled via an i.MX RT MCU
+(Cortex-M7, plenty of headroom for a simple I2C poll) with its own telemetry
+channel back to the i.MX8MP (encoders, bumper, E-stop, status - see
+hardware/include/calixto-ros-bot/mcu_comms.hpp). Folding BNO055 reads into
+that SAME channel, instead of running a dedicated driver node on the i.MX8MP,
+would move the I2C polling cost off the SBC entirely - the i.MX8MP side would
+just be parsing a few more fields out of a packet it already receives, not
+running a whole separate 65 Hz node. Expected to recover close to the full
+9.2%, likely slightly under it (an Imu message still needs constructing and
+publishing from whatever the MCU hands over).
+
+In context: during an active nav2 goal the board runs at ~75.5% CPU busy
+(~24.5% headroom). Freeing ~9 points of total capacity would take that to
+roughly ~66.5% busy / ~33.5% headroom - a ~35-40% increase in the margin that
+was actually tight today.
+
+What is needed, none of which lives in this repo:
+  * Confirm the physical wiring - is BNO055 on the i.MX8MP's own I2C bus
+    right now, or already reachable from the MCU's?
+  * MCU firmware work: read the BNO055 registers, add orientation/angular
+    velocity/linear acceleration fields to the existing telemetry frame
+    format (mcu_frame_protocol.h - the MCU firmware's own repo, not this
+    one). Must not introduce jitter into the real-time motor control loop -
+    run it as a lower-priority task, not inline with motor timing.
+  * i.MX8MP side: extend diffbot_system.cpp's existing telemetry parsing to
+    also read the new fields and publish Imu, instead of launching the
+    separate bno055 driver node.
+
+### 2. RETRACTED 2026-10-09 (same day) - costmap rates were never backwards
+
+Originally claimed global_costmap updates at 5.0 Hz and local_costmap at only
+1.0 Hz, and proposed swapping them. That was wrong - a line-number mismatch
+while grepping without context (both sections share a `update_frequency:`
+line, and the wrong one got attributed to each). The actual config, verified
+by reading both `ros__parameters` blocks directly:
+
+    local_costmap:  update_frequency 5.0 Hz   (correct - close range, fast)
+    global_costmap: update_frequency 1.0 Hz   (correct - far range, slow)
+
+This is already the sensible way round, not backwards. No change needed, none
+applied. Checked against the actual behaviour tree
+(navigate_to_pose_w_replanning_and_recovery.xml, stock, not customised here):
+`RateController hz="1.0"` governs how often the global planner replans, which
+matches global_costmap's 1 Hz exactly - already in sync. local_costmap at
+5 Hz vs the controller reading it every cycle at 20 Hz is a 4x gap, not the
+20x this entry originally implied, and 5 Hz is nav2's own standard default
+for a local costmap - not a misconfiguration.
+
+A same-day 7-day reminder (routine trig_01W68RSD8NPvFdri8zidgTeM) was created
+and then corrected to drop this item once the error was caught.
+
+## 2026-10-09 — Waypoint loop runs in the web server, not nav2's waypoint_follower
+
+The web UI's new Waypoints & loop section (status_web_server.py) does NOT use
+nav2's own `nav2_waypoint_follower` / `/follow_waypoints` action. Deliberate
+trade-off, not an oversight:
+
+  * This board is already CPU-tight for navigation - see the 2026-10-08 entry
+    on sim_time/vtheta_samples having to be sized down after the controller
+    missed its 20 Hz deadline ~38x per goal at the "obvious" settings.
+    waypoint_follower would be a 9th long-running process, plus another
+    lifecycle node for lifecycle_manager to bring up and hold a bond to -
+    one more thing that can fail to activate the same way planner_server
+    already does while waiting on an initial pose.
+  * Instead the loop is implemented in status_web_server.py itself: a
+    background thread calls the same publish_goal() → /goal_pose that the
+    page's own click-and-drag goal already uses, and watches the goal-status
+    tracking added the same day (bt_navigator's own action-status topic) to
+    know when each leg finishes before sending the next.
+  * One failed/aborted/canceled waypoint stops the WHOLE loop, rather than
+    skipping ahead to the next one. A loop is meant to run unattended, and
+    "something went wrong, so it kept going and made it worse" is a worse
+    failure mode than "it stopped and is waiting for you" - especially given
+    the goal-abort spirals this same day that prompted the Cancel goal button
+    and the Restart navigation button in the first place.
+
+Revisit if nav2_waypoint_follower's CPU/process cost is ever actually
+measured and found acceptable - it has genuine features this reimplementation
+does not (waypoint task executors, pause-at-waypoint, etc.).
+
 ## 2026-10-08 — RViz freezes: tf2 BufferCore deadlock (root cause found, mitigated not fixed)
 
 RViz2 hangs permanently after anywhere from ~1 to ~7 minutes, the window stops

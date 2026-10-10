@@ -19,8 +19,8 @@
 # this file is already running, so processes can't end up duplicated.
 #
 # The container uses --network host, so this script also (re-)assigns the
-# LiDAR's subnet IP to the board's wired `end1` interface before starting
-# the driver. That IP is NOT persistent (plain `ip addr add`, not nmcli -
+# LiDAR's subnet IP and the office-network IP + default route to the board's
+# wired `end1` interface before starting any node. These are NOT persistent (plain `ip addr add`, not nmcli -
 # `end1` is NetworkManager-unmanaged) and is lost on every board reboot.
 #
 # Each process's log goes to /tmp/<name>_stack.log inside the container.
@@ -44,6 +44,13 @@ PIDFILE=/tmp/amr_stack.pids
 SERIAL_PORT="${1:-/dev/ttymxc2}"
 LIDAR_IFACE="${2:-end1}"
 LIDAR_HOST_IP="${3:-192.168.31.7/24}"
+# Office-network address on the same wire. The onboard USR-G806w router bridges
+# its LAN ports to the office WiFi (WLAN STA page: network = lan), so end1 sits
+# directly on the office subnet - this replaces the removed USB WiFi dongle and
+# keeps its old address, so `ssh imx8mp`, the HMI URL and rviz_remote's peer
+# list are unchanged.
+OFFICE_HOST_IP="${4:-192.168.1.62/24}"
+OFFICE_GATEWAY="${5:-192.168.1.1}"
 
 if [ -s "$PIDFILE" ]; then
     while read -r _ pgid; do
@@ -63,6 +70,13 @@ launch() {
     setsid "$@" > "/tmp/${name}_stack.log" 2>&1 &
     echo "$name $!" >> "$PIDFILE"
 }
+
+# Addresses before any node starts: a DDS participant only announces the
+# addresses present when it's created, so a node started before the office
+# address exists stays invisible to a laptop on the office network.
+sudo ip addr add "$LIDAR_HOST_IP" dev "$LIDAR_IFACE" 2>/dev/null || true
+sudo ip addr add "$OFFICE_HOST_IP" dev "$LIDAR_IFACE" 2>/dev/null || true
+sudo ip route replace default via "$OFFICE_GATEWAY" dev "$LIDAR_IFACE" 2>/dev/null || true
 
 echo "[1/7] Starting bno055 ..."
 launch bno055 ros2 launch bno055 bno055.launch.py
@@ -92,7 +106,6 @@ launch remote_node python3 /ros2_ws/src/ros-amr/web_hmi/remote_ros_node.py
 sleep 2
 
 echo "[7/7] Starting LiDAR driver (bluesea2) ..."
-sudo ip addr add "$LIDAR_HOST_IP" dev "$LIDAR_IFACE" 2>/dev/null || true
 launch lidar ros2 launch bluesea2 udp_lidar.launch
 sleep 3
 

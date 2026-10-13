@@ -56,6 +56,7 @@ Usage:
 """
 import argparse
 import base64
+import collections
 import json
 import math
 import os
@@ -77,8 +78,10 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Twi
 from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+import dock_manager
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
+from lifecycle_msgs.srv import GetState
 try:
     from nav2_msgs.action import NavigateToPose
     _NAV_FEEDBACK = NavigateToPose.Impl.FeedbackMessage
@@ -215,6 +218,29 @@ _latest_pose = {"received": False}
 
 _scan_lock = threading.Lock()
 _latest_scan = {"received": False}
+
+# Readiness (2026-10-12) - one place that answers "can I set the initial pose /
+# drive yet?". Before this, the page had no such indicator: poses sent while
+# navigation was still starting were silently dropped (AMCL takes ~15-20 s to
+# become active after a restart and ignores /initialpose until then), and
+# nothing said whether a pose had actually aligned with the LiDAR.
+_readiness_lock = threading.Lock()
+_readiness = {"state": "unknown", "title": "Checking...", "detail": "", "level": "unknown"}
+# The five nav2 lifecycle nodes that have to be ACTIVE before goals work.
+_NAV_NODES = ["map_server", "amcl", "planner_server", "controller_server", "bt_navigator"]
+# Alignment score = fraction of LiDAR returns that land on (or next to) an
+# occupied cell of the saved map when the scan is placed using the current
+# map->odom correction. 1.0 = every return sits on a wall of the map. Furniture
+# or people lower it even when localization is right, so the thresholds are
+# deliberately loose - they were checked against live scans, see
+# PENDING_ISSUES.md. READY needs the score at or above _ALIGN_OK; the bar
+# only drops back out of READY below _ALIGN_OK - _ALIGN_HYST so it doesn't flicker.
+_ALIGN_OK = 0.50
+_ALIGN_LOW = 0.30
+_ALIGN_HYST = 0.08
+# AMCL's own confidence (std-dev of its particle cloud, from /amcl_pose).
+_SIGMA_XY_OK = 0.35   # metres
+_SIGMA_YAW_OK = 0.30  # radians (~17 deg)
 # Sensor data convention (2026-10-02) - LaserScan publishers (bluesea2
 # included) commonly use BEST_EFFORT reliability; a default RELIABLE
 # subscription wouldn't connect at all (same class of silent QoS/type
@@ -363,8 +389,30 @@ class HmiNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._map_to_odom = None
+        self._m2o_stamp = None        # stamp of the last map->odom seen, to tell a live AMCL from a stale one
+        self._m2o_changed = 0.0       # monotonic time that stamp last changed
         self.create_timer(0.2, self._refresh_map_to_odom)  # 5Hz - see get_map_to_odom()
         self.create_subscription(OccupancyGrid, "/map", self._on_map, 1)
+        # --- readiness (2026-10-12), see _poll_readiness() ---
+        self._last_scan_msg = None
+        self._last_scan_seen = 0.0    # monotonic
+        self._nav_map = None          # saved map as occupied-cell flags, for the alignment score
+        self._amcl_cov = None         # AMCL's own position/heading std-dev
+        self._pending_pose = None     # initial pose requested while AMCL wasn't active yet
+        self._lc_clients = {n: self.create_client(GetState, f"/{n}/get_state") for n in _NAV_NODES}
+        self._lc_state = {n: None for n in _NAV_NODES}   # lifecycle label, None = node not there
+        self._lc_pending = {}         # node -> (future, started monotonic)
+        self._align_score = None
+        self._ready_latched = False
+        self._pose_sent_at = 0.0
+        # map_server publishes /map once, TRANSIENT_LOCAL; amcl_pose is latched too.
+        self.create_subscription(OccupancyGrid, "/map", self._on_nav_map,
+                                 QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                                            reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_subscription(PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl_pose,
+                                 QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                                            reliability=QoSReliabilityPolicy.RELIABLE))
+        self.create_timer(1.0, self._poll_readiness)
         # Action status is published TRANSIENT_LOCAL by the action server, so a
         # latched subscription also gets the current state on connect.
         self.create_subscription(GoalStatusArray, "/navigate_to_pose/_action/status",
@@ -390,8 +438,19 @@ class HmiNode(Node):
         # looking correct, because of exactly this.
         self._teleop_pub = self.create_publisher(Twist, "/cmd_vel_teleop", 10)
         self._teleop_lock = threading.Lock()
+        # Raw /scan for dock detection (2026-10-13). /scan_filtered drops most of the dock V's points, so
+        # the dock vision needs the raw scan. Subscribed only while someone asks (see get_raw_scan()):
+        # a 2000-point message at 15 Hz is not free on this board.
+        self._raw_sub = None
+        self._raw_scan_msg = None
+        self._raw_scan_t = 0.0
+        self._raw_used = 0.0
+        self.dock_busy = False        # a dock/undock job owns the wheels: the page's joystick is ignored meanwhile
         self._teleop_session = None
         self._teleop_seq = -1
+        # Per-page clock offsets for the stale-command check, see _teleop_age_ms().
+        self._teleop_offsets = collections.deque()
+        self.teleop_stale_count = 0
         # Software-only "EMERGENCY STOP" (2026-10-02) - see twist_mux.yaml's
         # software_stop entry for exactly what this does and doesn't
         # guarantee (not a real E-stop - no firmware involved, nothing
@@ -455,6 +514,10 @@ class HmiNode(Node):
             "y": t.transform.translation.y,
             "theta": 2.0 * math.atan2(q.z, q.w),
         }
+        stamp = (t.header.stamp.sec, t.header.stamp.nanosec)
+        if stamp != self._m2o_stamp:
+            self._m2o_stamp = stamp
+            self._m2o_changed = time.monotonic()
 
     def get_map_to_odom(self):
         """The correction AMCL produces once localized - None before that. Composed
@@ -463,6 +526,10 @@ class HmiNode(Node):
         return self._map_to_odom
 
     def _on_scan(self, msg: LaserScan):
+        # Kept by reference for the 1 Hz alignment score (readiness) - cheap,
+        # unlike the per-point conversion below.
+        self._last_scan_msg = msg
+        self._last_scan_seen = time.monotonic()
         # 2026-10-09: throttled to ~5Hz (matches the page's pollScan
         # interval) instead of doing this ~1000-point Python loop at the
         # LiDAR's full ~15Hz publish rate regardless of whether anyone is
@@ -529,7 +596,214 @@ class HmiNode(Node):
         msg.pose.covariance[7] = 0.25
         msg.pose.covariance[35] = 0.06853891945200942
         self._initial_pose_pub.publish(msg)
+        self._pose_sent_at = time.monotonic()
         self.get_logger().info(f"Published /initialpose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
+
+    # ------------------------------------------------------------------
+    # Readiness (2026-10-12)
+    # ------------------------------------------------------------------
+    def request_initial_pose(self, x: float, y: float, theta: float) -> str:
+        """Entry point for the page's "set initial pose". Returns "sent" or "queued".
+
+        AMCL ignores /initialpose until it is ACTIVE, which takes ~15-20 s
+        after a navigation (re)start - on 2026-10-12 two poses in a row were
+        silently lost that way, and the page had no way to say so. So: if AMCL
+        is not active yet the pose is kept and sent the moment it is. When it
+        is active the pose goes out twice, 0.5 s apart, instead of the page
+        resending it five times (each message makes AMCL rebuild its whole
+        particle cloud, which is not free on this board)."""
+        if self._lc_state.get("amcl") == "active":
+            self._pending_pose = None
+            self.publish_initial_pose(x, y, theta)
+            threading.Timer(0.5, self.publish_initial_pose, args=(x, y, theta)).start()
+            return "sent"
+        self._pending_pose = (x, y, theta)
+        self.get_logger().info(f"AMCL not active yet - queued initial pose x={x:.2f} y={y:.2f} theta={theta:.2f}")
+        return "queued"
+
+    def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        c = msg.pose.covariance
+        self._amcl_cov = {
+            "sxy": math.sqrt(max(c[0], c[7], 0.0)),
+            "syaw": math.sqrt(max(c[35], 0.0)),
+        }
+
+    def _on_nav_map(self, msg: OccupancyGrid):
+        self._nav_map = {
+            "w": msg.info.width, "h": msg.info.height, "res": msg.info.resolution,
+            "ox": msg.info.origin.position.x, "oy": msg.info.origin.position.y,
+            "occ": bytearray(1 if v >= 65 else 0 for v in msg.data),
+        }
+
+    def _compute_alignment(self):
+        """Fraction (0..1) of the latest LiDAR returns that fall on, or next
+        to, an occupied cell of the saved map when placed with the current
+        map->odom correction. None if it can't be computed yet. ~400 rays at
+        1 Hz in plain Python: a couple of ms."""
+        m, msg = self._nav_map, self._last_scan_msg
+        if m is None or msg is None:
+            return None
+        try:
+            t = self._tf_buffer.lookup_transform("map", msg.header.frame_id or "laser_frame", Time())
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+        q = t.transform.rotation
+        yaw = 2.0 * math.atan2(q.z, q.w)
+        c, s = math.cos(yaw), math.sin(yaw)
+        tx, ty = t.transform.translation.x, t.transform.translation.y
+        w, h, res, ox, oy, occ = m["w"], m["h"], m["res"], m["ox"], m["oy"], m["occ"]
+        n_rays = len(msg.ranges)
+        step = max(1, n_rays // 400)
+        rmax = msg.range_max * 0.98
+        hits = total = 0
+        for i in range(0, n_rays, step):
+            r = msg.ranges[i]
+            if not (msg.range_min < r < rmax):  # also rejects nan / inf (no return)
+                continue
+            a = msg.angle_min + i * msg.angle_increment
+            lx, ly = r * math.cos(a), r * math.sin(a)
+            ci = int((tx + lx * c - ly * s - ox) / res)
+            cj = int((ty + lx * s + ly * c - oy) / res)
+            total += 1
+            found = False
+            for jj in (cj - 1, cj, cj + 1):
+                if 0 <= jj < h:
+                    row = jj * w
+                    for ii in (ci - 1, ci, ci + 1):
+                        if 0 <= ii < w and occ[row + ii]:
+                            found = True
+                            break
+                if found:
+                    break
+            if found:
+                hits += 1
+        return hits / total if total >= 30 else None
+
+    def _poll_readiness(self):
+        """1 Hz. Works out one state for the page's status bar:
+        base_down -> nav_off -> nav_starting -> need_pose -> aligning -> ready."""
+        now_m, now = time.monotonic(), time.time()
+        self._drop_idle_raw_scan()
+
+        # Lifecycle state of each nav2 node: one async GetState call each, never
+        # more than one outstanding, so a node that is stuck can't pile requests up.
+        for name, cli in self._lc_clients.items():
+            pend = self._lc_pending.get(name)
+            if pend is not None:
+                fut, t0 = pend
+                if fut.done():
+                    try:
+                        self._lc_state[name] = fut.result().current_state.label
+                    except Exception:
+                        self._lc_state[name] = None
+                    del self._lc_pending[name]
+                elif now_m - t0 > 4.0:
+                    fut.cancel()
+                    try:
+                        cli.remove_pending_request(fut)
+                    except Exception:
+                        pass
+                    self._lc_state[name] = None
+                    del self._lc_pending[name]
+                continue
+            if cli.service_is_ready():
+                self._lc_pending[name] = (cli.call_async(GetState.Request()), now_m)
+            else:
+                self._lc_state[name] = None
+        states = dict(self._lc_state)
+
+        # Base stack: MCU telemetry, LiDAR and odometry all flowing.
+        with _status_lock:
+            mcu_t = _latest_status.get("stamp") if _latest_status.get("received") else None
+        with _pose_lock:
+            odom_t = _latest_pose.get("stamp") if _latest_pose.get("received") else None
+        mcu_ok = mcu_t is not None and now - mcu_t < 3.0
+        odom_ok = odom_t is not None and now - odom_t < 3.0
+        scan_ok = (now_m - self._last_scan_seen) < 3.0 and self._last_scan_msg is not None
+        base_ok = mcu_ok and odom_ok and scan_ok
+
+        nav_seen = any(v is not None for v in states.values())
+        nav_active = all(v == "active" for v in states.values())
+
+        # A pose requested before AMCL was up goes out the moment it is.
+        if self._pending_pose and states.get("amcl") == "active":
+            px, py, pth = self._pending_pose
+            self._pending_pose = None
+            self.publish_initial_pose(px, py, pth)
+            threading.Timer(0.5, self.publish_initial_pose, args=(px, py, pth)).start()
+
+        tf_fresh = self._map_to_odom is not None and (now_m - self._m2o_changed) < 3.0
+        align = self._compute_alignment() if (nav_active and tf_fresh) else None
+        self._align_score = align
+        cov = self._amcl_cov if (nav_active and tf_fresh) else None
+
+        # Hysteresis: once READY, only drop out when clearly worse.
+        need_align = _ALIGN_OK - (_ALIGN_HYST if self._ready_latched else 0.0)
+        align_good = align is None or align >= need_align
+        cov_good = cov is None or (cov["sxy"] <= _SIGMA_XY_OK and cov["syaw"] <= _SIGMA_YAW_OK)
+
+        pct = f"{round(align * 100)}%" if align is not None else "n/a"
+        if not base_ok:
+            missing = [n for n, ok in (("motor controller", mcu_ok), ("LiDAR", scan_ok), ("odometry", odom_ok)) if not ok]
+            state, level = "base_down", "error"
+            title = "ROBOT SOFTWARE NOT READY"
+            detail = "Waiting for: " + ", ".join(missing) + ". It is either still starting up or stopped - use Restart everything if this lasts more than a minute or two."
+        elif not nav_seen:
+            state, level = "nav_off", "warn"
+            title = "NAVIGATION OFF"
+            detail = "The robot software is up but navigation is not running. Choose a map and press Start navigation."
+        elif not tf_fresh and states.get("amcl") == "active" and states.get("map_server") == "active":
+            # nav2's planner_server cannot finish activating until the "map" frame
+            # exists, i.e. until AMCL has a pose (documented in PENDING_ISSUES.md),
+            # and bt_navigator waits behind it. While it waits it doesn't even answer
+            # status requests. So with AMCL up and no pose yet, the planner/BT being
+            # "not up" is NORMAL - the pose is what unblocks them.
+            state, level = "need_pose", "warn"
+            title = "READY FOR INITIAL POSE"
+            detail = ("Pose received - sending it to AMCL..." if self._pending_pose else
+                      "Click \"Set initial pose\", then drag on the map where the robot really is, pointing the way it faces. "
+                      "(The planner and navigator finish starting only after this.)")
+        elif not nav_active or not tf_fresh:
+            state, level = "nav_starting", "warn"
+            waiting = [f"{n} ({states[n] or 'not up'})" for n in _NAV_NODES if states[n] != "active"]
+            title = "NAVIGATION STARTING..."
+            detail = (("Pose received - finishing navigation start-up. " if tf_fresh else
+                       "You can already set the initial pose - it is held and sent the moment AMCL is ready. ")
+                      + "Waiting for: " + ", ".join(waiting))
+        elif align_good and cov_good:
+            state, level = "ready", "ok"
+            title = "READY TO DRIVE"
+            extra = f", position +/-{round(cov['sxy'] * 100)} cm" if cov else ""
+            detail = f"Localized - LiDAR matches the map ({pct}){extra}."
+        else:
+            state, level = "aligning", "warn"
+            if align is not None and align < _ALIGN_LOW:
+                title = "NOT ALIGNED WITH THE MAP"
+                detail = (f"The LiDAR scan does not match the map ({pct}). Set the initial pose again - closer to where the robot really "
+                          "is, and pointing the way it really faces.")
+            elif align is not None and not align_good:
+                title = "ALIGNING..."
+                detail = f"LiDAR match {pct} - still settling. Give it a few seconds; if it stays low, set the initial pose again."
+            else:
+                title = "ALIGNING..."
+                detail = (f"LiDAR match {pct}, but AMCL is still unsure of the position "
+                          f"(+/-{round(cov['sxy'] * 100)} cm). Wait a few seconds, or drive a short way.")
+        self._ready_latched = (state == "ready")
+
+        data = {
+            "state": state, "level": level, "title": title, "detail": detail,
+            "checks": {
+                "base": base_ok, "mcu": mcu_ok, "scan": scan_ok, "odom": odom_ok,
+                "nav": states, "nav_active": nav_active, "localized": tf_fresh,
+                "align": align, "sigma_xy": cov["sxy"] if cov else None,
+                "sigma_yaw": cov["syaw"] if cov else None,
+                "pending_pose": self._pending_pose is not None,
+            },
+            "stamp": now,
+        }
+        with _readiness_lock:
+            _readiness.clear()
+            _readiness.update(data)
 
     def _on_goal_status(self, msg: GoalStatusArray):
         if not msg.status_list:
@@ -578,6 +852,32 @@ class HmiNode(Node):
         self._goal_pub.publish(msg)
         self.get_logger().info(f"Published /goal_pose: x={x:.2f} y={y:.2f} theta={theta:.2f}")
 
+    def _on_raw_scan(self, msg):
+        self._raw_scan_msg = msg
+        self._raw_scan_t = time.monotonic()
+
+    def get_raw_scan(self):
+        """Latest raw /scan, or None if it has not arrived (the first call after idle only subscribes)."""
+        self._raw_used = time.monotonic()
+        if self._raw_sub is None:
+            self._raw_sub = self.create_subscription(LaserScan, "/scan", self._on_raw_scan, _SCAN_QOS)
+        return self._raw_scan_msg if time.monotonic() - self._raw_scan_t < 1.0 else None
+
+    def _drop_idle_raw_scan(self):
+        if self._raw_sub is not None and time.monotonic() - self._raw_used > 15.0:
+            self.destroy_subscription(self._raw_sub)
+            self._raw_sub = None
+            self._raw_scan_msg = None
+
+    def get_map_pose(self):
+        """Robot pose in the map frame (x, y, theta) from tf, or None if not localized."""
+        try:
+            t = self._tf_buffer.lookup_transform("map", "base_link", Time())
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+        q = t.transform.rotation
+        return (t.transform.translation.x, t.transform.translation.y, 2.0 * math.atan2(q.z, q.w))
+
     def cancel_navigation(self) -> bool:
         """Cancels whatever nav2 goal is in flight right now, however it was
         sent - this page, RViz, the CLI. A CancelGoal.Request with its
@@ -588,24 +888,58 @@ class HmiNode(Node):
         self._cancel_client.call_async(CancelGoal.Request())
         return True
 
-    def publish_teleop(self, linear: float, angular: float, session=None, seq=None):
+    # A motion command that spent more than this longer in transit than the page's
+    # fastest recent commands is obsolete: the robot would be obeying where the
+    # thumb WAS. 250 ms at 0.3 m/s is already 7.5 cm of unwanted travel.
+    TELEOP_MAX_EXTRA_AGE_MS = 250.0
+
+    def _teleop_age_ms(self, t_ms: float) -> float:
+        """How much LATER than usual this command arrived, in ms.
+
+        The page stamps each command with its own clock (t_ms), which has no fixed
+        relation to this machine's clock. So: offset = (arrival time here) - (page
+        stamp) for every command, and the SMALLEST offset seen in the last 10 s is
+        taken as the "no extra delay" baseline - the extra delay of this command is
+        its offset above that. A constant slow link is not detected here (the
+        page's Link badge and its slow-link stop handle that); queueing bursts and
+        hiccups are. Caller holds _teleop_lock."""
+        now = time.monotonic()
+        off = now * 1000.0 - t_ms
+        dq = self._teleop_offsets
+        dq.append((now, off))
+        while dq and now - dq[0][0] > 10.0:
+            dq.popleft()
+        return off - min(o for _, o in dq)
+
+    def publish_teleop(self, linear: float, angular: float, session=None, seq=None, t_ms=None) -> str:
+        """Returns "ok", "old" (arrived after a newer command) or "stale" (held up in transit)."""
         # Commands from the browser carry a per-page session id and an
         # increasing sequence number. Over a laggy link, older motion commands
         # can arrive after a newer stop; dropping anything older than the newest
         # accepted command stops that from restarting motion.
+        if self.dock_busy:
+            return "dock_busy"
         with self._teleop_lock:
             if session is not None and seq is not None:
                 if session != self._teleop_session:
                     self._teleop_session = session
                     self._teleop_seq = -1
+                    self._teleop_offsets.clear()   # a different page = a different clock
                 if seq <= self._teleop_seq:
-                    return False
+                    return "old"
                 self._teleop_seq = seq
+            if t_ms is not None:
+                age = self._teleop_age_ms(float(t_ms))
+                # Only MOTION is refused when late. A stop is always applied, however
+                # late it is - delaying a stop is the dangerous direction.
+                if (linear != 0.0 or angular != 0.0) and age > self.TELEOP_MAX_EXTRA_AGE_MS:
+                    self.teleop_stale_count += 1
+                    return "stale"
             msg = Twist()
             msg.linear.x = linear
             msg.angular.z = angular
             self._teleop_pub.publish(msg)
-            return True
+            return "ok"
 
     def publish_estop(self):
         # Always zero - this is a stop button, not a drive command. The
@@ -620,8 +954,28 @@ HTML_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Calixto AMR - HMI</title>
+<script>
+// Phone-friendly layout switch (2026-10-12). Runs before the page paints so
+// there is no flash of the wrong layout. Order: ?ui=mobile / ?ui=desktop in the
+// address (also remembered), then the saved choice from the "Mobile view"
+// toggle, then a first-visit guess (touch screen AND narrow window = phone).
+(function () {
+  var mode = null, touch = false;
+  try {
+    var q = new URLSearchParams(location.search).get('ui');
+    if (q === 'mobile' || q === 'desktop') { localStorage.setItem('amr_ui_mode', q); }
+    mode = localStorage.getItem('amr_ui_mode');
+  } catch (e) { /* private mode / storage blocked: fall through to the guess */ }
+  touch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  if (!mode) { mode = (touch && window.matchMedia('(max-width: 800px)').matches) ? 'mobile' : 'desktop'; }
+  var h = document.documentElement;
+  if (mode === 'mobile') { h.classList.add('mobile'); }
+  if (touch) { h.classList.add('touch'); }
+  window.AMR_MOBILE = (mode === 'mobile');   // read by the page script (joystick is always live in this layout)
+})();
+</script>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -747,6 +1101,178 @@ HTML_PAGE = """<!doctype html>
   .keygrid span.active { background: #2f6fed; border-color: #2f6fed; color: #fff; }
   .remote-map td:first-child { font-weight: 600; color: #2f6fed; }
   code { font-size: 0.78rem; background: #eceef1; padding: 0.1rem 0.3rem; border-radius: 4px; }
+  /* Readiness bar (2026-10-12): one line that says whether the robot can be driven yet. */
+  .ready-bar {
+    flex: 0 0 auto;   /* a wrapping flex row can otherwise shrink below its real height and spill over the map */
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem;
+    padding: 0.45rem 1rem; border-bottom: 1px solid #d8dbe0; background: #eceef1; color: #4b5563;
+  }
+  .ready-pill {
+    font-weight: 700; font-size: 0.85rem; letter-spacing: 0.03em; padding: 0.25rem 0.8rem;
+    border-radius: 999px; background: #6b7280; color: #fff; white-space: nowrap;
+  }
+  .ready-detail { font-size: 0.82rem; flex: 1 1 22rem; line-height: 1.35; }
+  .ready-checks { font-size: 0.74rem; color: #6b7280; white-space: nowrap; }
+  /* Dock bar (2026-10-13): Dock / Undock / Save home / Pose from dock, right under the readiness bar. */
+  .dock-bar {
+    flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.5rem;
+    padding: 0.3rem 1rem; border-bottom: 1px solid #d8dbe0; background: #f5f6f8;
+  }
+  .dock-bar .dock-label { font-weight: 700; font-size: 0.8rem; color: #4b5563; margin-right: 0.2rem; }
+  .dock-bar button { padding: 0.3rem 0.7rem; font-size: 0.82rem; }
+  .dock-bar button[hidden] { display: none; }
+  .dock-bar button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .dock-status { font-size: 0.8rem; color: #374151; flex: 1 1 14rem; line-height: 1.3; }
+  .dock-status.fail { color: #8f2a1f; } .dock-status.run { color: #1d4ed8; font-weight: 600; }
+  html.mobile .dock-bar { padding: 0.25rem 0.6rem; }
+  html.mobile .dock-bar button { padding: 0.45rem 0.7rem; font-size: 0.85rem; }
+  .ready-bar.ok    { background: #e6f4ea; } .ready-bar.ok .ready-pill    { background: #1e7e34; } .ready-bar.ok .ready-detail    { color: #1e5a2a; }
+  .ready-bar.warn  { background: #fff6da; } .ready-bar.warn .ready-pill  { background: #b7791f; } .ready-bar.warn .ready-detail  { color: #6b4a08; }
+  .ready-bar.error { background: #fde8e8; } .ready-bar.error .ready-pill { background: #c0392b; } .ready-bar.error .ready-detail { color: #8f2a1f; }
+  button.needs-pose { animation: poseglow 1.4s ease-in-out infinite; }
+  @keyframes poseglow { 0%, 100% { box-shadow: 0 0 0 0 rgba(183,121,31,0.0); } 50% { box-shadow: 0 0 0 5px rgba(183,121,31,0.45); } }
+  /* Restart overlay: shown while the robot software is being torn down and rebuilt. */
+  .restart-overlay {
+    position: fixed; inset: 0; z-index: 9999; display: none; align-items: center; justify-content: center;
+    background: rgba(20,24,33,0.72);
+  }
+  .restart-overlay.show { display: flex; }
+  .restart-card {
+    width: min(34rem, 92vw); background: #fff; border-radius: 12px; padding: 1.2rem 1.4rem;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+  }
+  .restart-card h2 { margin: 0 0 0.2rem; font-size: 1.1rem; }
+  .restart-card .sub { font-size: 0.8rem; color: #6b7280; margin-bottom: 0.7rem; }
+  .restart-steps { list-style: none; margin: 0 0 0.8rem; padding: 0; font-size: 0.88rem; }
+  .restart-steps li { display: flex; gap: 0.6rem; padding: 0.22rem 0; color: #9ca3af; }
+  .restart-steps li .mark { width: 1.2rem; text-align: center; }
+  .restart-steps li.running { color: #1a1d24; font-weight: 600; }
+  .restart-steps li.done { color: #1e7e34; }
+  .restart-steps li.failed { color: #c0392b; font-weight: 600; }
+  .restart-steps li .det { font-weight: 400; color: #6b7280; font-size: 0.78rem; margin-left: 0.4rem; }
+  .restart-msg { font-size: 0.85rem; min-height: 1.2em; margin-bottom: 0.6rem; }
+  .restart-msg.err { color: #c0392b; }
+  .restart-msg.ok { color: #1e7e34; font-weight: 600; }
+
+  /* ---- Touch tool + phone layout (2026-10-12) ---- */
+  .uitoggle { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; color: #4b5563; cursor: pointer; user-select: none; }
+  .uitoggle input { width: 1.1rem; height: 1.1rem; }
+  /* Touch tool: what ONE finger does on the map. Hidden on mouse-only machines. */
+  #tool-btn { position: absolute; right: 0.8rem; top: 0.6rem; z-index: 6; display: none; font-weight: 600;
+              background: #2f6fed; color: #fff; border-color: #2f6fed; }
+  #tool-btn.pan { background: #fff; color: #1a1d24; border-color: #9aa3b0; }
+  html.touch #tool-btn { display: inline-block; }
+  .mbar { display: none; }
+  .sheet-close { display: none; }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  /* Wrappers added for the phone layout. On desktop they must change nothing:
+     the stage fills the map area exactly like the canvas used to, and the
+     control zone generates no box at all (its children keep their old absolute
+     positions relative to the map area). */
+  .map-stage { position: absolute; inset: 0; }
+  .ctl-zone { display: contents; }
+  .ph-speed { display: none; }
+  #map-expand-btn { position: absolute; left: 0.4rem; top: 0.4rem; z-index: 6; display: none; font-weight: 600; background: #fff; }
+  .link-badge { position: absolute; right: 0.4rem; top: 0.4rem; z-index: 6; display: none; padding: 0.3rem 0.65rem;
+                border-radius: 999px; font-size: 0.78rem; font-weight: 700; background: #eceef1; color: #6b7280; }
+  .link-badge.ok { background: #e6f4ea; color: #1e7e34; }
+  .link-badge.warn { background: #fff6da; color: #93690a; }
+  .link-badge.bad { background: #fde8e8; color: #c0392b; }
+  html.mobile .link-badge { display: inline-block; }
+
+  html.mobile header.topbar { padding: 0.35rem 0.6rem; gap: 0.4rem; flex-wrap: wrap; }
+  html.mobile header.topbar h1 { display: none; }
+  html.mobile .logo { height: 30px; margin-right: 6px; }
+  html.mobile .badges { gap: 0.35rem; }
+  html.mobile .badge { padding: 0.25rem 0.55rem; font-size: 0.75rem; }
+  html.mobile .ready-bar { padding: 0.3rem 0.6rem; gap: 0.25rem 0.6rem; }
+  html.mobile .ready-pill { font-size: 0.78rem; padding: 0.2rem 0.65rem; }
+  html.mobile .ready-detail { font-size: 0.74rem; flex-basis: 100%; order: 3; max-height: 3.9em; overflow: hidden; }
+  html.mobile .ready-checks { display: none; }
+  /* The map fills the screen; the side panel becomes a slide-up sheet. */
+  /* flex: 1 1 0 - NOT the desktop "1 1 auto": this layout's only child is absolute, so its
+     base size is 0 and it could never shrink when the readiness bar grows after first
+     paint (the page then overflowed and clipped the bottom buttons). Grow-from-zero
+     always takes exactly what is left. */
+  html.mobile .layout { display: block; position: relative; min-height: 0; flex: 1 1 0; }
+  html.mobile main.map-main { position: absolute; inset: 0; min-height: 0; }
+  html.mobile aside.sidebar {
+    position: fixed; left: 0; right: 0; bottom: 0; max-height: 78vh; z-index: 60; border-left: none;
+    border-radius: 16px 16px 0 0; box-shadow: 0 -10px 36px rgba(0,0,0,0.35); padding: 0.8rem;
+    transform: translateY(110%); transition: transform 0.2s ease-out;
+  }
+  html.mobile aside.sidebar.open { transform: none; }
+  html.mobile .sheet-close { display: block; width: 100%; margin-bottom: 0.6rem; font-weight: 600; }
+  html.mobile button, html.mobile select, html.mobile input[type=text], html.mobile input[type=number] { min-height: 44px; font-size: 1rem; }
+  html.mobile .tabs { gap: 6px; }
+  html.mobile .map-hint { display: none; }
+
+  /* ---- Phone layout, portrait: three bands (2026-10-12) ----
+       [ E-STOP + status ]  top    - always in thumb/eye reach
+       [      MAP        ]  middle - 30% of the height; "Expand map" for placing goals
+       [ joystick | btns ]  bottom - the rest, everything big
+     On desktop .map-stage and .ctl-zone are invisible wrappers (see below), so
+     nothing outside html.mobile changes. */
+  html.mobile main.map-main { display: flex; flex-direction: column; background: #ffffff; }
+  html.mobile .topleft-panel {
+    position: static; order: 1; flex: 0 0 auto; width: auto; box-shadow: none; border-radius: 0;
+    display: flex; gap: 0.5rem; align-items: stretch; padding: 0.4rem 0.5rem; border-bottom: 1px solid #d8dbe0;
+  }
+  html.mobile .topleft-panel .hint, html.mobile .topleft-panel #conn { display: none; }
+  html.mobile .topleft-panel .estop-btn { flex: 1 1 52%; min-height: 66px; font-size: 1.15rem; margin: 0; }
+  html.mobile .topleft-panel .amr-status-box { flex: 1 1 48%; min-height: 66px; padding: 0.4rem 0.6rem; font-size: 0.85rem; line-height: 1.3; margin: 0; }
+  html.mobile .map-stage { position: relative; inset: auto; order: 2; flex: 0 0 30%; min-height: 150px; overflow: hidden; isolation: isolate; }
+  html.mobile #tool-btn { display: none; }   /* the bottom button area has its own copy */
+  html.mobile #recenter-btn { bottom: 0.4rem; right: 0.4rem; min-height: 40px; }
+  html.mobile #map-expand-btn { display: block; }
+  /* The zone is a size container so the joystick can be as big as the space
+     allows and still round: width = the smaller of its column and the row height
+     (zone height minus the 3rem speed row and the two gaps). */
+  html.mobile .ctl-zone {
+    order: 3; flex: 1 1 0; min-height: 0; display: grid; gap: 0.6rem; container-type: size;
+    grid-template-columns: minmax(0, 1fr) 8.8rem; grid-template-rows: minmax(0, 1fr) 3rem;
+    padding: 0.6rem 0.6rem calc(0.6rem + env(safe-area-inset-bottom));
+  }
+  html.mobile .joystick-base {
+    display: block !important; position: relative; left: auto; bottom: auto; grid-column: 1; grid-row: 1;
+    width: min(100%, calc(100cqh - 3.6rem)); height: auto; aspect-ratio: 1 / 1; justify-self: center; align-self: center;
+    background: rgba(47,111,237,0.08); border: 3px solid #9aa3b0;
+  }
+  html.mobile .joystick-knob { width: 38%; height: 38%; }
+  html.mobile .mbar {
+    display: grid; grid-column: 2; grid-row: 1; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 0.45rem; min-height: 0;
+  }
+  html.mobile .mbar button { min-height: 0; font-size: 1.05rem; font-weight: 600; line-height: 1.15; padding: 0.3rem 0.4rem; }
+  html.mobile #mb-tool { display: block; }
+  html.mobile .ph-speed { display: block; grid-column: 1 / span 2; grid-row: 2; height: 3rem; }
+  html.mobile .ph-speed label { display: flex; align-items: center; gap: 0.6rem; height: 100%; font-size: 0.95rem; font-weight: 600; white-space: nowrap; }
+  html.mobile .ph-speed input[type=range] { flex: 1; height: 2.2rem; }
+  /* Map expanded: the map takes the screen; the joystick and speed bar step aside. */
+  html.mobile.map-expanded .map-stage { flex: 1 1 0; min-height: 0; }
+  html.mobile.map-expanded .ctl-zone { flex: 0 0 auto; display: block; container-type: normal; padding: 0.4rem 0.5rem calc(0.4rem + env(safe-area-inset-bottom)); }
+  html.mobile.map-expanded .joystick-base, html.mobile.map-expanded .ph-speed { display: none !important; }
+  html.mobile.map-expanded .mbar { display: grid; grid-template-rows: none; grid-template-columns: repeat(4, 1fr); }
+  html.mobile.map-expanded .mbar button { min-height: 52px; }
+  /* Landscape phone: map on the left, E-stop + controls on the right. */
+  @media (orientation: landscape) {
+    html.mobile main.map-main { display: grid; grid-template-columns: 1.35fr 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    html.mobile .map-stage { grid-column: 1; grid-row: 1 / span 2; flex: none; min-height: 0; }
+    html.mobile .topleft-panel { grid-column: 2; grid-row: 1; }
+    html.mobile .ctl-zone { grid-column: 2; grid-row: 2; }
+    html.mobile .topleft-panel .estop-btn, html.mobile .topleft-panel .amr-status-box { min-height: 52px; }
+    html.mobile .ready-detail { display: none; }
+    /* Short and wide: buttons 2 x 2 beside the joystick, smaller labels. */
+    html.mobile .ctl-zone { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr); gap: 0.4rem; padding: 0.4rem; grid-template-rows: minmax(0, 1fr) 2.4rem; }
+    html.mobile .ph-speed { height: 2.4rem; }
+    html.mobile .mbar { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); gap: 0.35rem; }
+    html.mobile .mbar button { font-size: 0.85rem; line-height: 1.05; padding: 0.15rem 0.25rem; }
+    html.mobile .ph-speed label { font-size: 0.8rem; gap: 0.4rem; }
+    html.mobile .joystick-base { width: min(100%, calc(100cqh - 3.2rem)); }
+    html.mobile.map-expanded main.map-main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto auto; }
+    html.mobile.map-expanded .map-stage { grid-column: 1; grid-row: 1; }
+    html.mobile.map-expanded .topleft-panel { grid-column: 1; grid-row: 2; }
+    html.mobile.map-expanded .ctl-zone { grid-column: 1; grid-row: 3; }
+  }
 </style>
 </head>
 <body>
@@ -758,8 +1284,24 @@ HTML_PAGE = """<!doctype html>
         <div class="battery-fill"></div><span class="battery-pct">--%</span>
       </div>
       <span id="pose-badge" class="badge unknown">Pose: unknown</span>
+      <label class="uitoggle" title="Switches this page to a phone-friendly layout (big buttons, full-screen map). The page reloads."><input type="checkbox" id="mobile-toggle"> Mobile view</label>
     </div>
   </header>
+  <div id="ready-bar" class="ready-bar">
+    <span id="ready-pill" class="ready-pill">CHECKING...</span>
+    <span id="ready-detail" class="ready-detail">Waiting for the robot's status...</span>
+    <span id="ready-checks" class="ready-checks"></span>
+  </div>
+  <div id="dock-bar" class="dock-bar">
+    <span class="dock-label">Dock</span>
+    <button id="dock-go" disabled title="Drive to the dock and reverse into it">Dock</button>
+    <button id="dock-undock" disabled title="Drive forward off the dock">Undock</button>
+    <button id="dock-teach" disabled title="Save this spot, 1.5 m in front of the V and facing it, as the dock waypoint">Teach waypoint</button>
+    <button id="dock-save" disabled title="Save the docked position as this map's home">Save home</button>
+    <button id="dock-pose" disabled title="Set the initial pose from the saved home (robot must be on the dock)">Pose from dock</button>
+    <button id="dock-cancel" class="danger" hidden>Cancel dock</button>
+    <span id="dock-status" class="dock-status">checking...</span>
+  </div>
 
   <div class="layout">
     <main class="map-main">
@@ -769,14 +1311,31 @@ HTML_PAGE = """<!doctype html>
         <div id="amr-status" class="amr-status-box unknown">No data yet</div>
         <div id="conn" class="hint">connecting...</div>
       </div>
-      <canvas id="map-canvas"></canvas>
-      <div class="map-hint">Mouse: left-drag sets goal, right-drag pans, scroll zooms &middot;
-      Touch: drag pans, pinch zooms, long-press-then-drag sets a goal</div>
-      <button id="recenter-btn">Center on robot</button>
-      <div id="joystick-base" class="joystick-base"><div id="joystick-knob" class="joystick-knob"></div></div>
+      <div class="map-stage">
+        <canvas id="map-canvas"></canvas>
+        <div class="map-hint">Mouse: left-drag sets goal, right-drag pans, scroll zooms &middot;
+        Touch: drag pans, pinch zooms, long-press-then-drag sets a goal</div>
+        <button id="recenter-btn">Center on robot</button>
+        <button id="tool-btn" title="What one finger does on the map: place a goal / initial pose, or move the map. Two fingers always move and zoom.">Touch: set goal</button>
+        <button id="map-expand-btn" title="Make the map fill the screen to place a goal precisely; tap again to bring the joystick back.">Expand map</button>
+        <span id="link-badge" class="link-badge" title="Round trip from this page to the robot, over the last 20 requests. Green is fine for driving; amber is sluggish; red is too slow to drive by hand.">Link ...</span>
+      </div>
+      <div class="ctl-zone">
+        <div id="joystick-base" class="joystick-base"><div id="joystick-knob" class="joystick-knob"></div></div>
+        <div id="mbar" class="mbar">
+          <button id="mb-pose">Set initial pose</button>
+          <button id="mb-cancel" class="danger">Cancel goal</button>
+          <button id="mb-tool">Touch: set goal</button>
+          <button id="mb-menu">Menu</button>
+        </div>
+        <div id="ph-speed" class="ph-speed">
+          <label>Speed limit <input type="range" id="ph-speed-range" min="0.1" max="0.8" step="0.05" value="0.3"> <span id="ph-speed-val">0.30 m/s</span></label>
+        </div>
+      </div>
     </main>
 
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
+      <button id="sheet-close" class="sheet-close">Close menu</button>
       <div class="tabs">
         <button class="tab active" data-tab="control">Speed &amp; control</button>
         <button class="tab" data-tab="mapping">Mapping</button>
@@ -821,6 +1380,7 @@ HTML_PAGE = """<!doctype html>
             <button id="nav-start-btn">Start navigation</button>
             <button id="nav-stop-btn">Stop navigation</button>
             <button id="nav-restart-btn" title="Stops and starts nav2 again with the selected map - use this if it has frozen or stopped responding to goals.">Restart navigation</button>
+            <button id="restart-all-btn" class="danger" title="Tears down EVERYTHING - navigation, the whole robot software and its container - and starts it all again from scratch, then navigation on the selected map. Takes about 2 minutes. This page shows progress.">Restart everything</button>
           </div>
           <div class="modes">
             <button id="nav-pose-mode-btn">Set initial pose</button>
@@ -1348,11 +1908,90 @@ let teleopKey = null;
 // number, so the server can drop late, stale commands (see publish_teleop).
 const teleopSession = Math.random().toString(36).slice(2);
 let teleopSeq = 0;
-function teleopPublish(linear, angular) {
-  const seq = ++teleopSeq;
-  fetch('/teleop', { method: 'POST', body: JSON.stringify({ linear, angular, session: teleopSession, seq }) })
-    .catch(() => {});
+
+// ---- Teleop sender (2026-10-12) ----
+// Before: EVERY pointer-move / key event fired its own fetch('/teleop') - 60 to
+// 120 a second from a phone thumb - with nothing limiting how many were in
+// flight, and the STOP when you let go was a single request. Over a phone's WiFi
+// those requests queue behind each other, so the robot obeyed commands that were
+// already old, and the stop waited in the same queue (a robot hit something
+// under phone control that day). Now there is ONE sender loop:
+//   - 20 sends a second at most, and never more than one request in flight;
+//     if the previous one hasn't returned, the next tick sends the NEWEST
+//     command ("latest wins") instead of adding to a backlog;
+//   - a stop is repeated for ~0.4 s, so one lost packet can't leave it moving;
+//   - every request gives up after 400 ms and is timed (the Link badge);
+//   - every command carries the page's clock so the server can refuse commands
+//     that were held up in transit (see publish_teleop). The page itself never
+//     decides a command is fine - the server and the robot's own timeouts do.
+const TELEOP_PERIOD_MS = 50;
+const TELEOP_TIMEOUT_MS = 400;
+let teleopCmd = { linear: 0, angular: 0 };
+let teleopStopsLeft = 0;
+let teleopTimer = null;
+let teleopBusy = false;
+const rttHist = [];   // recent round trips in ms; a failed/timed-out request counts as 1000
+
+function noteRtt(ms) {
+  rttHist.push(ms === null ? 1000 : ms);
+  if (rttHist.length > 20) rttHist.shift();
+  updateLinkBadge();
 }
+function linkStats(n) {
+  const a = rttHist.slice(-(n || 20)).sort((x, y) => x - y);
+  return a.length ? { med: a[Math.floor(a.length / 2)], worst: a[a.length - 1], n: a.length } : null;
+}
+function updateLinkBadge() {
+  const b = document.getElementById('link-badge');
+  const s = linkStats();
+  if (!b || !s) return;
+  b.textContent = 'Link ' + Math.round(s.med) + ' ms (worst ' + Math.round(s.worst) + ')';
+  b.className = 'link-badge ' + (s.worst > 300 ? 'bad' : s.worst > 150 ? 'warn' : 'ok');
+}
+// Too slow to drive by hand: stop sending motion until it recovers.
+function linkTooSlow() {
+  const s = linkStats(5);
+  return !!s && s.n >= 5 && s.med > 350;
+}
+
+function teleopPublish(linear, angular) {
+  teleopCmd = { linear, angular };
+  if (linear === 0 && angular === 0) teleopStopsLeft = 8;
+  if (!teleopTimer) teleopTimer = setInterval(teleopTick, TELEOP_PERIOD_MS);
+}
+async function teleopTick() {
+  const moving = teleopCmd.linear !== 0 || teleopCmd.angular !== 0;
+  if (!moving && teleopStopsLeft <= 0) { clearInterval(teleopTimer); teleopTimer = null; return; }
+  if (teleopBusy) return;            // latest wins: the next tick sends the newest command
+  if (!moving) teleopStopsLeft--;
+  teleopBusy = true;
+  const seq = ++teleopSeq;
+  const t0 = performance.now();
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TELEOP_TIMEOUT_MS);
+  try {
+    const res = await fetch('/teleop', {
+      method: 'POST', signal: ctl.signal,
+      body: JSON.stringify({ linear: teleopCmd.linear, angular: teleopCmd.angular, session: teleopSession, seq, t: t0 })
+    });
+    await res.json();
+    noteRtt(performance.now() - t0);
+  } catch (e) {
+    noteRtt(null);
+  } finally {
+    clearTimeout(timer);
+    teleopBusy = false;
+  }
+}
+// Measure the link while not driving too (a cheap GET once a second), so the
+// badge always shows the current state of the connection.
+async function pingLink() {
+  if (teleopBusy || teleopTimer) return;
+  const t0 = performance.now();
+  try { await (await fetch('/speed.json', { cache: 'no-store' })).json(); noteRtt(performance.now() - t0); }
+  catch (e) { noteRtt(null); }
+}
+setInterval(pingLink, 1000);
 
 function highlightTeleopKey() {
   document.querySelectorAll('.keygrid span').forEach(s => {
@@ -1423,15 +2062,35 @@ function updateJoystickKnob(nx, ny) {
   joystickKnob.style.top = `${50 + ny * 50}%`;
 }
 
+// Phone layout (2026-10-12): the joystick is always on and has its OWN speed
+// limit (default 0.3 m/s, the "Speed limit" slider under it), kept only in this
+// browser. The shared limit (teleopLinearMax, which the RF remote also reads via
+// /speed) is deliberately left alone, so using the phone never changes how fast
+// the RF remote can drive. Turning is capped in proportion (2.5 rad/s per m/s),
+// and never above the shared angular limit.
+let phoneLinMax = 0.3;
+try { const s = parseFloat(localStorage.getItem('amr_phone_speed')); if (s >= 0.1 && s <= 0.8) phoneLinMax = s; } catch (e) { /* default */ }
+function joystickLimits() {
+  if (window.AMR_MOBILE) return [phoneLinMax, Math.min(teleopAngularMax, phoneLinMax * 2.5)];
+  return [teleopLinearMax, teleopAngularMax];
+}
 function joystickPublish() {
   const [nx, ny] = joystickVec;
+  // A median round trip over 350 ms means the robot would react a good half
+  // second late: refuse to drive (send stops) until the link recovers.
+  if (window.AMR_MOBILE && linkTooSlow()) {
+    teleopPublish(0, 0);
+    document.getElementById('nav-status').textContent = 'LINK TOO SLOW to drive safely (' + Math.round(linkStats(5).med) + ' ms) - the robot is being held stopped. Move closer to the router or switch WiFi band.';
+    return;
+  }
+  const [linMax, angMax] = joystickLimits();
   // Pushing the stick up (negative ny) drives forward; pushing right
   // (positive nx) turns right (angular.z negative, CW per REP-103).
-  teleopPublish(-ny * teleopLinearMax, -nx * teleopAngularMax);
+  teleopPublish(-ny * linMax, -nx * angMax);
 }
 
 joystickBase.addEventListener('pointerdown', (evt) => {
-  if (currentMode !== 'teleop') return;
+  if (currentMode !== 'teleop' && !window.AMR_MOBILE) return;
   joystickBase.setPointerCapture(evt.pointerId);
   joystickActive = true;
   joystickVec = joystickVecFromEvent(evt);
@@ -1453,11 +2112,13 @@ function endJoystick() {
 }
 joystickBase.addEventListener('pointerup', endJoystick);
 joystickBase.addEventListener('pointercancel', endJoystick);
+joystickBase.addEventListener('lostpointercapture', endJoystick);   // any way the finger is lost = stop
 window.addEventListener('blur', endJoystick);
+document.addEventListener('visibilitychange', () => { if (document.hidden) endJoystick(); });  // phone locked / app switched
 // Same resend reasoning as keyboard teleop - keep cmd_vel_mux's timeout fed
 // while the stick is held still (pointermove doesn't fire without motion).
 setInterval(() => {
-  if (currentMode === 'teleop' && joystickActive) joystickPublish();
+  if ((currentMode === 'teleop' || window.AMR_MOBILE) && joystickActive) joystickPublish();
 }, 200);
 
 // ---- 2D canvas pose view ----
@@ -1485,6 +2146,12 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 resizeCanvas();
+// 2026-10-12: also follow the map's own container. The window 'resize' event is not
+// enough in the phone layout: the header wrapping, the readiness bar growing, the
+// Expand map button and rotating the phone all change the map area without
+// resizing the window, and a canvas left at its old size paints over the buttons
+// below it.
+if (window.ResizeObserver) { new ResizeObserver(() => resizeCanvas()).observe(canvas.parentElement); }
 
 // World (odom frame, ROS convention: +x forward, +y left) <-> canvas pixel.
 // view.originX/Y is the world point currently at the canvas center (i.e. the
@@ -1582,11 +2249,45 @@ fetch('/maps.json').then(r => r.json()).then(d => {
 }).catch(() => {});
 
 let canvasClickMode = 'goal';  // 'goal', 'initialpose' or 'waypoint' - see the mode buttons below
-document.getElementById('nav-pose-mode-btn').addEventListener('click', (e) => {
-  canvasClickMode = canvasClickMode === 'goal' ? 'initialpose' : 'goal';
-  e.target.classList.toggle('active', canvasClickMode === 'initialpose');
-  e.target.textContent = canvasClickMode === 'initialpose' ? 'Click the map to set initial pose...' : 'Set initial pose';
+// 2026-10-12: pose mode is one-shot again, and the button locks for a short
+// while after a pose is sent. It had been sticky (2026-10-09) so a second drag
+// couldn't silently become a goal - but then, with the goal flow being the
+// normal thing to do next, tapping "Set initial pose" again out of habit
+// re-armed pose mode and the next goal drag overwrote the pose. The readiness
+// bar now gives the feedback that sticky mode was standing in for, so: pose
+// sent -> back to goal mode, button locked. It unlocks sooner if the bar says
+// the pose must be redone (nothing set yet / LiDAR doesn't match the map), and
+// asks first if the robot is already localized.
+const POSE_LOCK_MS = 20000;
+let poseLockUntil = 0;
+function poseRetryAllowed() {
+  const c = (typeof lastReady !== 'undefined' && lastReady.checks) || {};
+  const st = typeof lastReady !== 'undefined' ? lastReady.state : 'unknown';
+  return st === 'need_pose' || (st === 'aligning' && c.align != null && c.align < 0.30);
+}
+function refreshPoseButtons() {
+  const locked = Date.now() < poseLockUntil && !poseRetryAllowed();
+  const armed = canvasClickMode === 'initialpose';
+  const left = Math.max(0, Math.ceil((poseLockUntil - Date.now()) / 1000));
+  ['nav-pose-mode-btn', 'mb-pose'].forEach(id => {
+    const b = document.getElementById(id);
+    if (!b) return;
+    b.disabled = locked;
+    b.classList.toggle('active', armed);
+    b.textContent = locked ? ('Pose set - locked ' + left + 's') : (armed ? 'Drag on the map: initial pose...' : 'Set initial pose');
+  });
+}
+document.getElementById('nav-pose-mode-btn').addEventListener('click', () => {
+  if (canvasClickMode !== 'initialpose') {
+    if (Date.now() < poseLockUntil && !poseRetryAllowed()) return;
+    if (typeof lastReady !== 'undefined' && lastReady.state === 'ready' &&
+        !confirm('The robot is already localized (READY TO DRIVE).\\n\\nSet the initial pose again?')) return;
+  }
+  canvasClickMode = canvasClickMode === 'initialpose' ? 'goal' : 'initialpose';
+  refreshPoseButtons();
 });
+document.getElementById('mb-pose').addEventListener('click', () => document.getElementById('nav-pose-mode-btn').click());
+setInterval(refreshPoseButtons, 500);
 
 async function sendNavigation(action) {
   const status = document.getElementById('nav-status');
@@ -1613,8 +2314,9 @@ document.getElementById('nav-restart-btn').addEventListener('click', () => {
     document.getElementById('nav-status').textContent = 'Choose a map first.';
     return;
   }
-  document.getElementById('nav-status').textContent = 'Restarting navigation - set the initial pose again once it is back up...';
-  sendNavigation('restart');
+  // 2026-10-12: goes through the restart helper (progress overlay); falls back
+  // to the old direct call if the helper isn't running - see startRestart().
+  startRestart('navigation');
 });
 
 // Robot footprint, from calixto-ros-bot.md: length 780 mm, width 480 mm.
@@ -1811,14 +2513,30 @@ async function publishGoalFromDrag(d) {
   const url = isPose ? '/initial_pose' : '/goal';
   const body = JSON.stringify({ x: gx, y: gy, theta: theta });
   if (isPose) {
-    // Resending is safe here: AMCL just takes the latest estimate, it does not
-    // treat each message as a new request. This guards against a one-shot
-    // message landing before AMCL's subscription has finished connecting.
-    for (let i = 0; i < 5; i++) {
-      try { await fetch(url, { method: 'POST', body }); } catch (e) { /* best-effort */ }
-      if (i < 4) await new Promise(r => setTimeout(r, 250));
+    // 2026-10-12: ONE request now (this used to send it five times, 250 ms
+    // apart, and every copy made AMCL rebuild its particle cloud). The server
+    // decides: if AMCL is already active it publishes the pose twice itself;
+    // if AMCL is still starting it HOLDS the pose and sends it the moment
+    // AMCL is up - before, a pose sent too early was silently dropped.
+    let outcome = 'sent';
+    try {
+      const res = await fetch(url, { method: 'POST', body });
+      const data = await res.json();
+      outcome = data.outcome || 'sent';
+    } catch (e) {
+      status.textContent = 'Could not reach the robot to send the initial pose - try again.';
+      return;
     }
+    // Back to goal mode and lock the button (see POSE_LOCK_MS above).
+    canvasClickMode = 'goal';
+    poseLockUntil = Date.now() + POSE_LOCK_MS;
+    refreshPoseButtons();
+    status.textContent = outcome === 'queued'
+      ? `Initial pose x=${gx.toFixed(2)} y=${gy.toFixed(2)} HELD - navigation is still starting, it will be sent automatically as soon as AMCL is ready (watch the bar at the top). Back in goal mode.`
+      : `Initial pose sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}. Watch the bar at the top - it turns green READY TO DRIVE once the LiDAR matches the map. Back in goal mode; the pose button is locked for ${POSE_LOCK_MS / 1000} s (it unlocks sooner if the pose needs redoing).`;
+    return;
   } else {
+    if (!confirmReady('goal')) { status.textContent = 'Goal not sent.'; return; }
     // Exactly one send: bt_navigator treats every /goal_pose message as a new
     // navigation request and cancels whatever was running - resending here
     // would cancel and restart navigation repeatedly instead of helping it.
@@ -1831,9 +2549,7 @@ async function publishGoalFromDrag(d) {
   // "Set initial pose" button is clicked again to turn it off, so you can
   // re-drag as many times as needed (e.g. while watching AMCL converge)
   // without it silently switching back to sending goals underneath you.
-  status.textContent = isPose
-    ? `Initial pose sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}. Check "Pose:" above says "localized". Still in pose mode - drag again to adjust, or click "Set initial pose" to turn it off.`
-    : `Goal sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}.`;
+  status.textContent = `Goal sent: x=${gx.toFixed(2)} y=${gy.toFixed(2)}.`;
 }
 
 window.addEventListener('mouseup', (evt) => {
@@ -1862,65 +2578,80 @@ canvas.addEventListener('wheel', (evt) => {
 }, { passive: false });
 
 // ---- Touch gestures (phone/tablet) ----
-// One finger: pans immediately once it moves past a small threshold: below
-// that threshold, it's held as a "pending" tap in case a long-press follows.
-// A long-press (350ms without moving) instead arms goal-placement, exactly
-// like a mouse left-drag - drag before lifting sets the heading.
-// Two fingers: pinch to zoom, centered on the midpoint between them.
-const LONG_PRESS_MS = 350;
+// 2026-10-12: reworked. Before, one finger PANNED and only a 350 ms
+// long-press-then-drag placed a goal, so a normal swipe always moved the map
+// and the goal/heading was very hard to set on a phone. Now:
+//   one finger  = the "touch tool": 'place' (default) puts a goal / initial
+//                 pose / waypoint at the touch-down point and the drag sets the
+//                 heading, exactly like the mouse; 'pan' moves the map instead
+//                 (button on the map toggles it);
+//   two fingers = ALWAYS move the map (both fingers dragging) and zoom (pinch).
+// A plain tap or a very short drag never sends anything - it needs a clear drag
+// to set the heading - so brushing the screen can't send the robot off.
 const PAN_THRESHOLD_PX = 12 * devicePixelRatio;
+const MIN_TOUCH_DRAG_PX = 28 * devicePixelRatio;
+let touchTool = 'place';          // 'place' | 'pan'
 let touchState = null;
-let longPressTimer = null;
+
+function refreshToolButtons() {
+  document.querySelectorAll('#tool-btn, #mb-tool').forEach(b => {
+    b.textContent = touchTool === 'place' ? 'Touch: set goal' : 'Touch: move map';
+    b.classList.toggle('pan', touchTool === 'pan');
+  });
+}
+document.querySelectorAll('#tool-btn, #mb-tool').forEach(b => b.addEventListener('click', () => {
+  touchTool = touchTool === 'place' ? 'pan' : 'place';
+  refreshToolButtons();
+}));
+refreshToolButtons();
 
 function touchCanvasPoint(touch) {
   const rect = canvas.getBoundingClientRect();
   return [(touch.clientX - rect.left) * devicePixelRatio, (touch.clientY - rect.top) * devicePixelRatio];
 }
+function touchMid(t0, t1) {
+  const rect = canvas.getBoundingClientRect();
+  return [((t0.clientX + t1.clientX) / 2 - rect.left) * devicePixelRatio,
+          ((t0.clientY + t1.clientY) / 2 - rect.top) * devicePixelRatio];
+}
 
 canvas.addEventListener('touchstart', (evt) => {
   evt.preventDefault();
-  clearTimeout(longPressTimer);
-  if (evt.touches.length === 2) {
+  if (evt.touches.length >= 2) {
     const [t0, t1] = evt.touches;
-    touchState = { mode: 'pinch', dist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) };
-    drag = null;
+    const [mx, my] = touchMid(t0, t1);
+    touchState = { mode: 'pinch', dist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY), midPx: mx, midPy: my };
+    drag = null;                  // a second finger cancels any goal being placed
     return;
   }
   if (evt.touches.length === 1) {
     const [px, py] = touchCanvasPoint(evt.touches[0]);
-    touchState = { mode: 'pending', startPx: px, startPy: py };
-    longPressTimer = setTimeout(() => {
-      if (touchState && touchState.mode === 'pending') {
-        touchState.mode = 'goal';
-        drag = { startPx: px, startPy: py, curPx: px, curPy: py };
-      }
-    }, LONG_PRESS_MS);
+    if (touchTool === 'place') {
+      touchState = { mode: 'goal' };
+      drag = { startPx: px, startPy: py, curPx: px, curPy: py };
+    } else {
+      touchState = { mode: 'pan', lastPx: px, lastPy: py };
+    }
   }
 }, { passive: false });
 
 canvas.addEventListener('touchmove', (evt) => {
   evt.preventDefault();
   if (!touchState) return;
-  if (touchState.mode === 'pinch' && evt.touches.length === 2) {
+  if (touchState.mode === 'pinch' && evt.touches.length >= 2) {
     const [t0, t1] = evt.touches;
     const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
-    const rect = canvas.getBoundingClientRect();
-    const midPx = ((t0.clientX + t1.clientX) / 2 - rect.left) * devicePixelRatio;
-    const midPy = ((t0.clientY + t1.clientY) / 2 - rect.top) * devicePixelRatio;
-    zoomAt(midPx, midPy, dist / touchState.dist);
-    touchState.dist = dist;
+    const [mx, my] = touchMid(t0, t1);
+    const scale = view.scale * devicePixelRatio;
+    // Move the map with the midpoint of the two fingers, then zoom about it.
+    view.originX += (my - touchState.midPy) / scale;
+    view.originY += (mx - touchState.midPx) / scale;
+    zoomAt(mx, my, dist / touchState.dist);
+    touchState.dist = dist; touchState.midPx = mx; touchState.midPy = my;
     return;
   }
   if (evt.touches.length !== 1) return;
   const [px, py] = touchCanvasPoint(evt.touches[0]);
-  if (touchState.mode === 'pending') {
-    if (Math.hypot(px - touchState.startPx, py - touchState.startPy) > PAN_THRESHOLD_PX) {
-      clearTimeout(longPressTimer);
-      touchState.mode = 'pan';
-      touchState.lastPx = px; touchState.lastPy = py;
-    }
-    return;
-  }
   if (touchState.mode === 'pan') {
     const scale = view.scale * devicePixelRatio;
     view.originX += (py - touchState.lastPy) / scale;
@@ -1935,14 +2666,19 @@ canvas.addEventListener('touchmove', (evt) => {
 
 canvas.addEventListener('touchend', (evt) => {
   evt.preventDefault();
-  clearTimeout(longPressTimer);
   if (touchState && touchState.mode === 'goal' && drag) {
     const d = drag;
     drag = null;
-    publishGoalFromDrag(d);
+    if (Math.hypot(d.curPx - d.startPx, d.curPy - d.startPy) < MIN_TOUCH_DRAG_PX) {
+      document.getElementById('nav-status').textContent =
+        'Nothing sent: drag from the spot to set the direction the robot should face (a tap is ignored).';
+    } else {
+      publishGoalFromDrag(d);
+    }
   }
   if (evt.touches.length === 0) touchState = null;
 }, { passive: false });
+canvas.addEventListener('touchcancel', () => { drag = null; touchState = null; }, { passive: true });
 
 async function pollPose() {
   try {
@@ -2064,6 +2800,7 @@ async function loadWaypoints() {
       const row = e.target.closest('.wp-row');
       const w = lastWaypoints.find(x => x.name === row.dataset.name);
       if (!w) return;
+      if (!confirmReady(`goal "${w.name}"`)) { document.getElementById('nav-status').textContent = 'Goal not sent.'; return; }
       document.getElementById('nav-status').textContent = `Sending goal: ${w.name}`;
       try {
         await fetch('/goal', { method: 'POST', body: JSON.stringify({ x: w.x, y: w.y, theta: w.theta }) });
@@ -2104,6 +2841,7 @@ document.getElementById('loop-start-btn').addEventListener('click', async () => 
   const repeat = parseInt(document.getElementById('loop-repeat').value, 10) || 0;
   if (!map) { loopStatus.textContent = 'Loop: choose a map first.'; return; }
   if (!names.length) { loopStatus.textContent = 'Loop: tick at least one waypoint above.'; return; }
+  if (!confirmReady('waypoint loop')) { loopStatus.textContent = 'Loop: not started.'; return; }
   try {
     const res = await fetch('/loop', { method: 'POST', body: JSON.stringify({ action: 'start', map, names, repeat }) });
     const data = await res.json();
@@ -2147,7 +2885,268 @@ setInterval(pollPose, 150);
 setInterval(pollScan, 200);
 setInterval(pollGoal, 500);
 setInterval(pollLoop, 1000);
+
+// ===== Readiness bar (2026-10-12) =====
+// One line that says whether the robot can be driven: base software up ->
+// navigation up -> initial pose set -> LiDAR matches the map -> READY.
+let lastReady = { state: 'unknown' };
+async function pollReadiness() {
+  const bar = document.getElementById('ready-bar');
+  try {
+    const res = await fetch('/readiness.json', { cache: 'no-store' });
+    const r = await res.json();
+    lastReady = r;
+    bar.className = 'ready-bar ' + (r.level || '');
+    document.getElementById('ready-pill').textContent = r.title || 'CHECKING...';
+    document.getElementById('ready-detail').textContent = r.detail || '';
+    const c = r.checks || {};
+    const nav = c.nav || {};
+    const navUp = Object.values(nav).filter(v => v === 'active').length;
+    document.getElementById('ready-checks').textContent = [
+      'Robot ' + (c.base ? 'OK' : '--'),
+      'Navigation ' + navUp + '/' + Object.keys(nav).length,
+      'Localized ' + (c.localized ? 'yes' : 'no'),
+      'LiDAR match ' + (c.align == null ? 'n/a' : Math.round(c.align * 100) + '%'),
+    ].join('   |   ');
+    // Draw the eye to the "Set initial pose" button exactly when it is needed.
+    document.getElementById('nav-pose-mode-btn')
+      .classList.toggle('needs-pose', r.state === 'need_pose' && canvasClickMode !== 'initialpose');
+  } catch (e) {
+    lastReady = { state: 'unknown' };
+    bar.className = 'ready-bar error';
+    document.getElementById('ready-pill').textContent = 'NO CONNECTION';
+    document.getElementById('ready-detail').textContent = "Cannot reach the robot's web server - it may be restarting.";
+    document.getElementById('ready-checks').textContent = '';
+  }
+}
+// A goal sent before the bar says READY often goes nowhere (no pose set yet) or
+// starts from a wrong pose. Ask first instead of failing silently; "unknown"
+// (the bar itself is unavailable) never blocks.
+function confirmReady(what) {
+  if (lastReady.state === 'ready' || lastReady.state === 'unknown') return true;
+  return confirm('The robot is not ready: ' + (lastReady.title || '') + '\\n' + (lastReady.detail || '') + '\\n\\nSend the ' + what + ' anyway?');
+}
+pollReadiness();
+setInterval(pollReadiness, 1000);
+
+// ===== Dock bar (2026-10-13) =====
+// Dock / Undock / Save home / Pose from dock. The dock is the map's home position.
+// The robot does all the driving itself (scripts/dock.py run by the server); the
+// page only starts, shows progress and cancels. While a job runs the server ignores
+// this page's joystick so the two never fight over the wheels.
+function dockMap() { return document.getElementById('nav-map-select').value; }
+function renderDock(d) {
+  const job = d.job || { state: 'idle' };
+  const running = job.state === 'running';
+  const caps = d.caps || {};
+  [['dock-go', 'dock'], ['dock-undock', 'undock'], ['dock-teach', 'teach'], ['dock-save', 'save'], ['dock-pose', 'pose']].forEach(([id, key]) => {
+    const b = document.getElementById(id);
+    const c = caps[key] || { ok: false, why: 'not available' };
+    b.disabled = !c.ok;
+    b.title = c.why || '';
+  });
+  document.getElementById('dock-cancel').hidden = !running;
+  const st = document.getElementById('dock-status');
+  let text, cls = '';
+  const recent = job.finished && d.now && (d.now - job.finished) < 120;
+  if (running) { text = (job.stage || 'Working') + ' - joystick locked; press Cancel dock or the E-stop to stop'; cls = 'run'; }
+  else if (job.state === 'failed' && recent) { text = 'Dock stopped: ' + (job.detail || 'failed'); cls = 'fail'; }
+  else if (job.state === 'done' && recent) { text = job.stage || 'Done'; }
+  else if (d.docked) { text = 'On the dock' + (d.home ? ' - home saved' : ' - no home saved yet'); }
+  else if (d.front) { text = 'Dock in view, ' + d.front.a.toFixed(1) + ' m ahead' + (d.wp ? ' - waypoint taught' : ' - no waypoint taught'); }
+  else { text = (d.wp ? 'Dock waypoint taught.' : 'No dock waypoint taught.') + ' Dock not in view.'; }
+  st.textContent = text;
+  st.className = 'dock-status ' + cls;
+}
+async function pollDock() {
+  try {
+    const res = await fetch('/dock_status.json?map=' + encodeURIComponent(dockMap()), { cache: 'no-store' });
+    renderDock(await res.json());
+  } catch (e) {
+    document.getElementById('dock-status').textContent = 'no connection';
+  }
+}
+async function dockAction(action, ask) {
+  const map = dockMap();
+  if (action !== 'cancel' && !map) { alert('Choose the map for navigation first (Navigation tab).'); return; }
+  if (ask && !confirm(ask)) return;
+  const st = document.getElementById('dock-status');
+  st.textContent = 'sending...';
+  try {
+    const res = await fetch('/dock', { method: 'POST', body: JSON.stringify({ action: action, map: map }) });
+    const data = await res.json();
+    st.textContent = 'Dock: ' + (data.detail || data.status);
+  } catch (e) {
+    st.textContent = 'Could not reach the server.';
+  }
+  setTimeout(pollDock, 600);
+}
+document.getElementById('dock-go').addEventListener('click', () => dockAction('dock',
+  'The robot will now drive by itself to the dock and reverse into it. Keep a hand on the E-stop and keep the way clear. Start?'));
+document.getElementById('dock-undock').addEventListener('click', () => dockAction('undock',
+  'The robot will drive 0.3 m straight forward off the dock. Is the way ahead clear? Start?'));
+document.getElementById('dock-teach').addEventListener('click', () => dockAction('teach_wp',
+  'Save the robot position now as the DOCK WAYPOINT of this map (about 1.5 m in front of the V, facing it)? The robot will drive here before docking, and the home (docked position) is updated from what the LiDAR sees. Old files are kept as backups.'));
+document.getElementById('dock-save').addEventListener('click', () => dockAction('save_home',
+  'Save the robot position now as the HOME (dock) of this map? It replaces the old home (a backup is kept).'));
+document.getElementById('dock-pose').addEventListener('click', () => dockAction('pose_from_dock',
+  'Set the initial pose from the saved home? Only do this if the robot is really sitting on the dock.'));
+document.getElementById('dock-cancel').addEventListener('click', () => dockAction('cancel', ''));
+pollDock();
+setInterval(pollDock, 1200);
+
+// ===== Phone layout controls (2026-10-12) =====
+// "Mobile view" reloads the page into the phone layout (full-screen map, big
+// buttons, the side panel as a slide-up Menu). The head script applies it
+// before first paint; ?ui=mobile / ?ui=desktop in the address also works and
+// is remembered, so a bookmark or a QR code can open straight into it.
+const mobileToggle = document.getElementById('mobile-toggle');
+mobileToggle.checked = document.documentElement.classList.contains('mobile');
+mobileToggle.addEventListener('change', () => {
+  location.href = location.pathname + '?ui=' + (mobileToggle.checked ? 'mobile' : 'desktop');
+});
+const sidebarEl = document.getElementById('sidebar');
+document.getElementById('mb-menu').addEventListener('click', () => sidebarEl.classList.add('open'));
+document.getElementById('sheet-close').addEventListener('click', () => sidebarEl.classList.remove('open'));
+document.getElementById('mb-cancel').addEventListener('click', () => document.getElementById('nav-cancel-btn').click());
+// Phone joystick speed limit (browser-local; see joystickLimits()).
+const phRange = document.getElementById('ph-speed-range');
+const phVal = document.getElementById('ph-speed-val');
+function showPhoneSpeed() { phRange.value = phoneLinMax; phVal.textContent = phoneLinMax.toFixed(2) + ' m/s'; }
+phRange.addEventListener('input', () => {
+  phoneLinMax = parseFloat(phRange.value);
+  try { localStorage.setItem('amr_phone_speed', String(phoneLinMax)); } catch (e) { /* not remembered, still applied */ }
+  showPhoneSpeed();
+});
+showPhoneSpeed();
+// Expand map: the map takes the screen so a goal can be placed precisely; the
+// joystick steps aside (and is released) until the map is shrunk again.
+const expandBtn = document.getElementById('map-expand-btn');
+expandBtn.addEventListener('click', () => {
+  const on = document.documentElement.classList.toggle('map-expanded');
+  expandBtn.textContent = on ? 'Shrink map' : 'Expand map';
+  endJoystick();
+  requestAnimationFrame(resizeCanvas);
+});
+if (document.documentElement.classList.contains('touch')) {
+  const hintEl = document.querySelector('.map-hint');
+  if (hintEl) {
+    hintEl.textContent = 'Touch: drag from a spot to set the goal and its heading - two fingers move and zoom the map - the "Touch:" button lets one finger move the map instead.';
+  }
+}
+
+// ===== Restart with progress (2026-10-12) =====
+// The restart is done by amr_ctl.py on the robot HOST (port 8081), NOT by this
+// web server: this server is part of the stack being restarted, so it cannot
+// survive tearing the stack down. The helper keeps running and reports each
+// stage; this page just shows them.
+const CTL = location.protocol + '//' + location.hostname + ':8081';
+let restartTimer = null;
+let restartMode = '';
+const rOverlay = document.getElementById('restart-overlay');
+
+function renderJob(job) {
+  const ul = document.getElementById('restart-steps');
+  ul.innerHTML = '';
+  (job.stages || []).forEach(s => {
+    const li = document.createElement('li');
+    li.className = s.state;
+    const mark = document.createElement('span');
+    mark.className = 'mark';
+    mark.textContent = s.state === 'done' ? '✔' : s.state === 'failed' ? '✖' : s.state === 'running' ? '▶' : '•';
+    const label = document.createElement('span');
+    label.textContent = s.name;
+    if (s.detail) {
+      const det = document.createElement('span');
+      det.className = 'det';
+      det.textContent = s.detail;
+      label.appendChild(det);
+    }
+    li.appendChild(mark);
+    li.appendChild(label);
+    ul.appendChild(li);
+  });
+}
+
+async function pollJob() {
+  clearTimeout(restartTimer);
+  const msg = document.getElementById('restart-msg');
+  try {
+    const res = await fetch(CTL + '/ctl/job', { cache: 'no-store' });
+    const job = await res.json();
+    renderJob(job);
+    document.getElementById('restart-sub').textContent =
+      (job.mode === 'everything' ? 'Full restart' : 'Navigation restart') + ' - ' + Math.round(job.elapsed || 0) + ' s elapsed';
+    if (job.state === 'running') { restartTimer = setTimeout(pollJob, 1000); return; }
+    if (job.state === 'done') {
+      msg.className = 'restart-msg ok';
+      msg.textContent = 'Done. Navigation is up - set the initial pose when the bar says READY FOR INITIAL POSE.';
+      setTimeout(() => { if (restartMode === 'everything') { location.reload(); } else { rOverlay.classList.remove('show'); } }, 2500);
+    } else {
+      msg.className = 'restart-msg err';
+      msg.textContent = 'Restart failed: ' + (job.error || 'see the steps above') + ' - you can try again.';
+      document.getElementById('restart-close-btn').hidden = false;
+    }
+  } catch (e) {
+    // The helper itself didn't answer (network blip) - keep trying.
+    msg.className = 'restart-msg';
+    msg.textContent = 'Waiting for the restart helper...';
+    restartTimer = setTimeout(pollJob, 2000);
+  }
+}
+
+async function startRestart(mode) {
+  const status = document.getElementById('nav-status');
+  const map = document.getElementById('nav-map-select').value;
+  if (!map) { status.textContent = 'Choose a map first.'; return; }
+  if (mode === 'everything' && !confirm('Restart EVERYTHING?\\n\\nThis stops the robot, tears down navigation, all robot software and its container, and starts it all again. It takes about 2 minutes, and the robot cannot be driven meanwhile.')) return;
+  let ok = false, err = '';
+  try {
+    const res = await fetch(CTL + '/ctl/restart', { method: 'POST', body: JSON.stringify({ mode, map }) });
+    const j = await res.json();
+    ok = !!j.ok;
+    err = j.error || '';
+  } catch (e) { err = 'restart helper not reachable'; }
+  if (!ok) {
+    if (mode === 'navigation' && err === 'restart helper not reachable') {
+      // Helper not installed: the old direct call still works for navigation only.
+      status.textContent = 'Restart helper not running - using the basic restart. Set the initial pose again once navigation is back up...';
+      sendNavigation('restart');
+      return;
+    }
+    status.textContent = 'Could not start the restart: ' + err + (err === 'restart helper not reachable' ? ' (the helper service amr-ctl must be installed on the robot - see docker/install_amr_ctl.sh).' : '');
+    return;
+  }
+  restartMode = mode;
+  document.getElementById('restart-title').textContent = mode === 'everything' ? 'Restarting everything' : 'Restarting navigation';
+  document.getElementById('restart-msg').className = 'restart-msg';
+  document.getElementById('restart-msg').textContent = 'Please wait - do not close this page.';
+  document.getElementById('restart-close-btn').hidden = true;
+  document.getElementById('restart-steps').innerHTML = '';
+  rOverlay.classList.add('show');
+  pollJob();
+}
+document.getElementById('restart-all-btn').addEventListener('click', () => startRestart('everything'));
+document.getElementById('restart-close-btn').addEventListener('click', () => rOverlay.classList.remove('show'));
+// If the page is (re)loaded while a restart is already running, pick it up.
+fetch(CTL + '/ctl/job', { cache: 'no-store' }).then(r => r.json()).then(job => {
+  if (job && job.state === 'running') {
+    restartMode = job.mode;
+    document.getElementById('restart-title').textContent = job.mode === 'everything' ? 'Restarting everything' : 'Restarting navigation';
+    rOverlay.classList.add('show');
+    pollJob();
+  }
+}).catch(() => { /* helper not installed - nothing to show */ });
 </script>
+<div id="restart-overlay" class="restart-overlay">
+  <div class="restart-card">
+    <h2 id="restart-title">Restarting</h2>
+    <div id="restart-sub" class="sub"></div>
+    <ul id="restart-steps" class="restart-steps"></ul>
+    <div id="restart-msg" class="restart-msg"></div>
+    <div class="modes"><button id="restart-close-btn" hidden>Close</button></div>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -2202,6 +3201,10 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             with _goal_lock:
                 data = dict(_latest_goal)
             self._send_json(data)
+        elif self.path == "/readiness.json":
+            with _readiness_lock:
+                data = dict(_readiness)
+            self._send_json(data)
         elif self.path == "/speed.json":
             lin, ang = self.server.hmi_node.speed_limits
             self._send_json({"linear": lin, "angular": ang})
@@ -2225,6 +3228,13 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "error", "detail": "unknown map"}, status=404)
                 return
             self._send_json({"waypoints": _load_waypoints(name)})
+        elif self.path.startswith("/dock_status.json"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name = query.get("map", [""])[0]
+            try:
+                self._send_json(self.server.dock_mgr.status(name if _valid_map_name(name) else ""))
+            except Exception as e:  # never let the dock panel take the page down
+                self._send_json({"error": str(e), "job": {"state": "idle"}, "caps": {}})
         elif self.path == "/loop_status.json":
             with _loop_lock:
                 data = dict(_loop_state)
@@ -2255,7 +3265,9 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path in ("/", "/index.html"):
+        # urlparse().path: the page is also opened as /?ui=mobile (see the
+        # head script), and an exact match on self.path would 404 that.
+        elif urllib.parse.urlparse(self.path).path in ("/", "/index.html"):
             body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2349,6 +3361,19 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "ok", "detail": detail})
             else:
                 self._send_json({"status": "error", "detail": f"unknown action '{action}'"}, status=400)
+        elif self.path == "/dock":
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                action = data["action"]
+                map_name = data.get("map", "")
+            except (ValueError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"status": "error", "detail": f"bad dock payload: {e}"}, status=400)
+                return
+            if action != "cancel" and not _valid_map_name(map_name):
+                self._send_json({"status": "error", "detail": "choose a map first"}, status=400)
+                return
+            ok, detail = self.server.dock_mgr.act(action, map_name)
+            self._send_json({"status": "ok" if ok else "error", "detail": detail}, status=200 if ok else 400)
         elif self.path == "/initial_pose":
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -2356,8 +3381,8 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             except (ValueError, KeyError, json.JSONDecodeError) as e:
                 self._send_json({"status": "error", "detail": f"bad initial pose payload: {e}"}, status=400)
                 return
-            self.server.hmi_node.publish_initial_pose(x, y, theta)
-            self._send_json({"status": "ok"})
+            outcome = self.server.hmi_node.request_initial_pose(x, y, theta)
+            self._send_json({"status": "ok", "outcome": outcome})
         elif self.path == "/navigation":
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -2408,9 +3433,9 @@ class HmiHTTPHandler(BaseHTTPRequestHandler):
             except (ValueError, KeyError, json.JSONDecodeError) as e:
                 self._send_json({"status": "error", "detail": f"bad teleop payload: {e}"}, status=400)
                 return
-            session, seq = data.get("session"), data.get("seq")
-            accepted = self.server.hmi_node.publish_teleop(linear, angular, session, seq)
-            self._send_json({"status": "ok", "accepted": accepted})
+            session, seq, t_ms = data.get("session"), data.get("seq"), data.get("t")
+            outcome = self.server.hmi_node.publish_teleop(linear, angular, session, seq, t_ms)
+            self._send_json({"status": "ok", "accepted": outcome == "ok", "outcome": outcome})
         elif self.path == "/mapping":
             try:
                 data = json.loads(raw.decode("utf-8"))
@@ -2494,6 +3519,31 @@ def main():
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), HmiHTTPHandler)
     server.hmi_node = node
+
+    def _goal_prev_id():
+        with _goal_lock:
+            return _latest_goal.get("id")
+
+    def _ready_state():
+        with _readiness_lock:
+            return _readiness.get("state")
+
+    def _loop_running():
+        with _loop_lock:
+            return bool(_loop_state.get("running"))
+
+    server.dock_mgr = dock_manager.DockManager({
+        "get_scan": node.get_raw_scan,
+        "ready_state": _ready_state,
+        "map_pose": node.get_map_pose,
+        "request_pose": node.request_initial_pose,
+        "publish_goal": node.publish_goal,
+        "goal_prev_id": _goal_prev_id,
+        "wait_goal": _loop_wait_for_goal,
+        "cancel_nav": node.cancel_navigation,
+        "loop_running": _loop_running,
+        "set_busy": lambda v: setattr(node, "dock_busy", v),
+    })
     print(f"HMI web page: http://localhost:{args.port}  (Ctrl+C to stop)")
     try:
         server.serve_forever()

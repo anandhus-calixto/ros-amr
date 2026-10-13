@@ -1,0 +1,552 @@
+# =============================================================================
+# STEP 1 - same planner/controller as before (Smac 2D + RotationShim + DWB).
+# Only the low-risk fixes. Every change is tagged "2026-10-08 step1".
+#
+#   1. controller_server.odom_topic           -> /odometry/filtered
+#   2. FollowPath shim ramp                   -> closed_loop: false, accel 10.0
+#   3. FollowPath.rotate_to_heading_angular_vel 1.3 -> 0.8
+#   4. FollowPath.forward_sampling_distance   1.0 -> 0.5
+#   5. inflation (local + global)             0.2 / 1.0 -> 0.6 / 2.5
+#   6. velocity_smoother angular accel/decel  1.5 -> 1.3
+#
+# Rebased on config/nav2_params.yaml as of 2026-10-08, so it keeps the drive
+# calibration done that day (wheel_separation 0.35 -> 0.384 in
+# diffbot_controllers.yaml, which made commanded rotation land within ~6% of
+# actual instead of ~21%).
+# =============================================================================
+
+amcl:
+  ros__parameters:
+    use_sim_time: False
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: "base_link"
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    do_beamskip: false
+    global_frame_id: "map"
+    lambda_short: 0.1
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 100.0
+    laser_min_range: -1.0
+    laser_model_type: "likelihood_field"
+    max_beams: 60
+    max_particles: 2000
+    min_particles: 500
+    odom_frame_id: "odom"
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    resample_interval: 1
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"  # OmniMotionModel
+    save_pose_rate: 0.5
+    sigma_hit: 0.2
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    update_min_a: 0.2
+    update_min_d: 0.25
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    scan_topic: /scan_filtered
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: False
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odometry/filtered
+    #odom_topic: /odom
+    # 2026-10-12: stock replanning+recovery tree with ONE change - if the Lattice planner
+    # fails, it retries with the 2D planner before giving up (see the XML's header).
+    default_nav_to_pose_bt_xml: /ros2_ws/src/ros-amr/behavior_trees/navigate_lattice_fallback.xml
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+
+bt_navigator_navigate_through_poses_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+bt_navigator_navigate_to_pose_rclcpp_node:
+  ros__parameters:
+    use_sim_time: False
+
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    controller_frequency: 20.0
+    # 2026-10-08 step1: ADDED. controller_server has its own odom_topic and it
+    # defaults to "odom". The controllers read the robot's current velocity
+    # from this topic, so point it at the same filtered odometry that
+    # bt_navigator and velocity_smoother already use.
+    odom_topic: /odometry/filtered
+    # CHANGED: was 0.001 / 0.5 / 0.001 — y-threshold corrected for diff drive
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001   # was 0.5 (wrong for differential drive)
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      # 2026-10-07: was 10.0 - too tight for a near-180 degree in-place turn.
+      # SimpleProgressChecker measures XY position change, which barely moves
+      # during in-place rotation, and a direct-motor test (bypassing ROS)
+      # found the right wheel delivers ~20% less distance in reverse than
+      # forward for the same command - a real, repeatable, wheel-specific
+      # weakness (not a planner/speed issue - see FollowPath's rotate_to_*
+      # comment below). A goal behind the robot needs a long, slow, mostly
+      # rotational turn before any translation starts, and was very likely
+      # hitting this time allowance and getting declared "stuck" before it
+      # ever had a chance to finish turning.
+      movement_time_allowance: 25.0
+
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      # 2026-10-09: 0.25 -> 0.15 rad (~14 deg -> ~8.6 deg). 0.25 let the goal
+      # count as "reached" well before the robot was actually pointing where
+      # the goal arrow was dragged - that is the "orientation not followed"
+      # symptom, not a control problem.
+      yaw_goal_tolerance: 0.15
+
+    FollowPath:
+      # ----- RotationShim wrapping DWB -----
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      # 2026-10-09: False -> True. With this False, the final turn onto the
+      # goal heading was done by DWB's RotateToGoal critic BLENDED with
+      # GoalAlign/PathDist/GoalDist every cycle - that optimisation hunts
+      # between "rotate" and "creep forward a bit" each 50ms tick, which is
+      # the goal-reach "dance". True hands the final turn to the shim itself:
+      # a plain in-place spin at rotate_to_heading_angular_vel, nothing else
+      # competing, done once xy_goal_tolerance is met.
+      rotate_to_goal_heading: True
+      angular_dist_threshold: 0.785          # engage shim above ~45 deg
+      # angular_disengage_threshold: 1.2     # UNCOMMENT if on Nav2 Iron or later (adds hysteresis)
+      # 2026-10-08 step1: back to 0.5. A goal behind the robot and closer than
+      # this distance gives the shim no sampling point, so it skips the in-place
+      # turn and hands the whole 180 degree turn to DWB.
+      forward_sampling_distance: 0.5
+      # 2026-10-07: were 1.6 / 1.5 - lowered after a direct-motor test (bypassing
+      # ROS, same ramp/hold profile as this controller) found the right wheel
+      # only delivers ~80% of the left wheel's distance when spinning in
+      # reverse for the same commanded velocity, for this robot's whole
+      # lifetime so far (not new damage). A lower absolute speed/accel target
+      # gives that wheel's closed-loop controller an easier, more trackable
+      # setpoint, instead of commanding a fast turn that one wheel physically
+      # can't keep up with - which read as "struggling" rather than a clean
+      # failure. Revisit this gap directly (drive current/torque tuning on
+      # that wheel's reverse direction) rather than raising these back up.
+      # 2026-10-07 (later): raised from 1.0/1.0 to 1.3/1.3 and max_vel_theta
+      # 0.6 -> 0.9 on request - turning was too slow in practice. Deliberately
+      # kept under the 1.6/1.5 backed out above, so the weak wheel still has
+      # margin. The reverse-direction gap itself is still unfixed; if turns
+      # start reading as "struggling" again, this is the first thing to undo.
+      # 2026-10-08 step1: 1.3 -> 0.8. The robot was most likely never reaching
+      # 1.3 because of the ramp problem fixed below; once that is fixed it WILL
+      # reach whatever is set here. Start at 0.8, raise only after the turn is
+      # smooth and the scan stays on the map.
+      # 2026-10-08 (jitter): 0.8 -> 0.6 -> 0.8
+      rotate_to_heading_angular_vel: 0.8
+      # 2026-10-08 step1: ramp fix (was max_angular_accel: 1.3, closed_loop
+      # unset). By default the shim limits each command to
+      #   measured angular velocity +/- max_angular_accel * 0.05 s
+      # which was only 0.065 rad/s above whatever odom reported. From a
+      # standstill that is too small to break stiction, so the wheels stuck,
+      # jumped, then stalled (the jerk / crawl / jitter on goals behind
+      # the robot).
+      #   closed_loop: false -> ramp from the last COMMAND, not from odom.
+      #   max_angular_accel: 10.0 -> if this Nav2 build ignores closed_loop,
+      #     the limit is loose enough to stop mattering.
+      # Either way the real ramp now happens in ONE place: velocity_smoother
+      # (max_accel[2], bottom of file). velocity_smoother must be running for
+      # this to be safe - check with
+      #   ros2 node list | grep velocity_smoother
+      closed_loop: false
+      # 2026-10-08 (jitter): 10.0 -> 1.0. Step1 raised this to 10.0 on the
+      # assumption velocity_smoother would do the ramping instead, but that
+      # node is NOT running in this stack, so nothing was limiting angular
+      # acceleration at all. closed_loop:false already fixes the stiction
+      # problem (it ramps from the last command, not from odom), so a real
+      # limit can go back without bringing the original symptom back.
+      max_angular_accel: 1.0
+      simulate_ahead_time: 1.0
+
+      # ----- DWB primary controller -----
+      # 2026-10-08: True -> False. It publishes every evaluated trajectory for
+      # visualisation - pure CPU overhead, and the controller was still missing
+      # its 20 Hz deadline (up to 50% of cycles) during goals.
+      debug_trajectory_details: False
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      # 2026-10-08: 0.15 -> 0.20 -> 0.30 -> 0.40
+      max_vel_x: 0.40
+      max_vel_y: 0.0
+      # 2026-10-08 (jitter): 0.9 -> 0.5 -> 0.8. Lowered to fight weaving, but
+      # the real cause was forward_point_distance 0.1 (now 0.325). With
+      # max_vel_x at 0.30 the robot cornered ~2.5x wider than originally
+      # (0.60 m radius at full speed); 0.8 brings it to 0.375 m.
+      max_vel_theta: 0.8
+      min_speed_xy: 0.0
+      max_speed_xy: 0.40
+      min_speed_theta: 0.001  # linear capped at 0.40 m/s, angular at 0.8 rad/s                 # was 0.4 — that value broke stopped-detection
+      acc_lim_x: 1.0
+      acc_lim_y: 0.0
+      # 2026-10-08 (jitter): 1.3 -> 0.8, decel matched at -0.8 (was -1.0).
+      # Asymmetric limits let DWB plan swerves it then cannot unwind.
+      acc_lim_theta: 0.8
+      decel_lim_x: -1.0
+      decel_lim_y: 0.0
+      decel_lim_theta: -0.8
+      # 2026-10-08: 20 -> 12. 20 linear samples is far more than a 0.3 m/s
+      # robot needs; trajectories per cycle 480 -> 288.
+      vx_samples: 12
+      vy_samples: 5
+      # 2026-10-08: 20 -> 40 -> 24. 40 with sim_time 2.0 was ~4x the original
+      # trajectory work per cycle and the i.MX8MP could not finish inside the
+      # 50 ms budget: 507 "Control loop missed its desired rate of 20 Hz"
+      # warnings, map->base_link extrapolation errors, and bt_navigator
+      # aborting the goal. 24/1.5 is ~1.8x the original - keeps most of the
+      # smoothing and still fits. Load was 6.1 on 4 cores at 40/2.0.
+      vtheta_samples: 24
+      # 2026-10-08: 1.2 -> 2.0 -> 1.5 (see vtheta_samples above).
+      sim_time: 1.5
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 1.0
+      xy_goal_tolerance: 0.25
+      trans_stopped_velocity: 0.05
+      short_circuit_trajectory_evaluation: True
+      stateful: True
+      # 2026-10-12 (step4): BaseObstacle -> ObstacleFootprint. BaseObstacle
+      # checks only the cell under the robot's centre (flags obstacles within
+      # 0.24 m); the corners of this 0.78 x 0.48 m body swing out to 0.46 m on
+      # a turn. Tried alone on 2026-10-10 it stopped corner hits but left the
+      # robot wiggling in tight spaces, because the 2D planner kept sending
+      # it down paths the body could not follow. With Lattice planning
+      # footprint-feasible paths that mismatch should be gone. Costs more
+      # controller CPU - measure.
+      critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      ObstacleFootprint.scale: 0.02
+      PathAlign.scale: 32.0
+      # 2026-10-08: 0.1 -> 0.325 (the Nav2 default) on both Align critics.
+      # At 0.1 m the alignment point sat essentially on the robot's nose, so a
+      # 2 cm lateral deviation read as a large heading error and DWB swung the
+      # robot back and forth - the left/right weaving on straight-line goals.
+      PathAlign.forward_point_distance: 0.325
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.325
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: False
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      footprint: "[[0.39, 0.24], [0.39, -0.24], [-0.39, -0.24], [-0.39, 0.24]]"
+      plugins: ["voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 2026-10-08 step1: were 1.0 / 0.2. This footprint has a half-width of
+        # 0.24 m and a corner reach of ~0.46 m. An inflation radius of 0.2 is
+        # smaller than both, so the planners got almost no cost gradient before
+        # an obstacle. 0.6 covers the corner reach with margin.
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.6
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: True
+        publish_voxel_map: True
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          topic: /scan_filtered
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      use_sim_time: False
+      footprint: "[[0.39, 0.24], [0.39, -0.24], [-0.39, -0.24], [-0.39, 0.24]]"
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan
+        scan:
+          topic: /scan_filtered
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 2026-10-08 step1: were 1.0 / 0.2 - see local_costmap comment. Kept
+        # equal to the local costmap so both planners see the same clearance.
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.6
+      always_send_full_costmap: True
+
+map_server:
+  ros__parameters:
+    use_sim_time: False
+    yaml_filename: ""
+
+map_saver:
+  ros__parameters:
+    use_sim_time: False
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+#planner_server:
+#  ros__parameters:
+#    expected_planner_frequency: 5.0         # was 20.0 — slower replans = stable lookahead
+#    use_sim_time: False
+#    planner_plugins: ["GridBased"]
+#    GridBased:
+#      plugin: "nav2_navfn_planner/NavfnPlanner"
+#      tolerance: 0.5
+#      use_astar: false
+#      allow_unknown: true
+      
+planner_server:
+  ros__parameters:
+    # 2026-10-12 (step4): the BT replans at 1 Hz (RateController hz=1.0), so
+    # 1.0 is the honest expectation - 20.0 would log a warning every time a
+    # Lattice search takes longer than 50 ms.
+    expected_planner_frequency: 1.0
+    use_sim_time: False
+    # 2026-10-12: two planners. "GridBased" is the Lattice planner (footprint- and
+    # heading-aware, the first choice). "Fallback2D" is the old SmacPlanner2D, used
+    # by the navigation tree (behavior_trees/navigate_lattice_fallback.xml) only
+    # when Lattice cannot plan. Lattice cannot plan very short moves (its smallest
+    # arcs are ~0.5 m: goals 0.2-0.7 m from the robot all failed with "no valid
+    # path"), and it refuses to plan when the robot's estimated pose puts its body
+    # on a wall ("starting point in lethal space"); the 2D planner handles both.
+    planner_plugins: ["GridBased", "Fallback2D"]
+    Fallback2D:
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.1                      # tight: plan to within 10 cm so short goals still produce a real path
+      allow_unknown: true
+      # false = the path's final pose takes the goal's requested heading (the arrow
+      # you drag), so the rotation shim turns the robot to it at the goal. step1 had
+      # this true, which ends the path along the approach direction and ignores the arrow.
+      use_final_approach_orientation: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      minimum_turning_radius: 0.0
+      lookup_table_size: 20.0
+      cost_travel_multiplier: 2.0
+    GridBased:
+      # 2026-10-12 (step4): SmacPlanner2D -> SmacPlannerLattice. 2D plans for
+      # a point and ignores heading, so it routes this 0.78 x 0.48 m robot
+      # through gaps it cannot fit or turn in. Lattice searches over
+      # precomputed arcs + in-place pivots (heading is part of the state) and
+      # checks the full footprint (taken from global_costmap's footprint).
+      plugin: "nav2_smac_planner/SmacPlannerLattice"
+      # Ships with Nav2 Humble: differential-drive set, 5 cm grid (matches the
+      # costmap resolution), 0.5 m turning radius, 16 headings, incl. pivots.
+      lattice_filepath: "/opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json"
+      tolerance: 0.25                     # was 0.5 with 2D; 0.5 would stop half a metre short
+      allow_unknown: true                 # saved map, unchanged from step1
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      # 5.0 -> 1.5: the tree replans once a second and now has a fallback, so a Lattice
+      # search that has not found a path in 1.5 s should hand over, not stall.
+      max_planning_time: 1.5
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0  # >= 4-5x turning radius (0.5 m)
+      # Forward-only for this test: the right wheel gives ~20% less distance
+      # in reverse and ~40% of the LiDAR's rear rays are blocked. Stage 2.
+      allow_reverse_expansion: false
+      reverse_penalty: 2.0
+      rotation_penalty: 5.0               # pivot only where needed
+      change_penalty: 0.05
+      non_straight_penalty: 1.05
+      cost_penalty: 2.0
+      retrospective_penalty: 0.015
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: False
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+behavior_server:
+  ros__parameters:
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors/AssistedTeleop"
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 1.0
+    # 2026-10-07: was left "true" when every other use_sim_time in this file
+    # was switched to false - nothing on this robot publishes /clock, so with
+    # this set, behavior_server's node clock never advances at all. Recovery
+    # behaviors (Spin, BackUp, ...) time themselves against that clock, so
+    # one would start ("Running spin" in the log) and then hang forever,
+    # never completing or timing out - confirmed live: a goal that failed to
+    # plan triggered a Spin recovery that got permanently stuck exactly like
+    # this, with zero further behavior_server log output and zero cmd_vel
+    # traffic, requiring a nav2 restart to recover.
+    use_sim_time: false
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 3.2
+
+robot_state_publisher:
+  ros__parameters:
+    use_sim_time: False
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: False
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: False
+    enable_stamped_cmd_vel: true
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.20, 0.0, 2.08]
+    min_velocity: [-0.15, 0.0, -2.08]
+    # 2026-10-08 step1: angular was 1.5 / -1.5. This is now the ONE place that
+    # ramps angular velocity for every source (shim, DWB, recovery spin).
+    # Because feedback is OPEN_LOOP it ramps from its own last output, so it
+    # does not suffer from the stiction problem the shim had.
+    max_accel: [1.0, 0.0, 1.3]
+    max_decel: [-1.0, 0.0, -1.3]
+    odom_topic: "/odometry/filtered"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0

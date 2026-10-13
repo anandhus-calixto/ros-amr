@@ -23,14 +23,19 @@ MAPS=/ros2_ws/src/ros-amr/maps
 # 2026-10-08: optional 2nd argument picks the params file, so step1/step2
 # tuning variants can be tried without overwriting nav2_params.yaml. Name only
 # (no .yaml, no path) - it is resolved against config/.
-# Default is nav2_params_step1 (2026-10-08), NOT the old baseline: the web
-# UI's "Start navigation" button calls this script with the map name only, so
-# whatever is defaulted here is what the button runs. step1 carries the day's
-# tuning (0.40 m/s, rotate-in-place + rotate-to-goal, the forward_point_distance
-# weaving fix, CPU-sized sampling). Pass nav2_params to get the old baseline.
-# step3 (Hybrid planner) was tried and rejected the same day: forward-only
+# Default is nav2_params_step4_lattice (2026-10-12): the web UI's "Start
+# navigation" / "Restart navigation" buttons call this script with the map name
+# only, so whatever is defaulted here is what they run. On 2026-10-12 a restart
+# silently fell back to step1 (SmacPlanner2D, use_final_approach_orientation:
+# true), which plans for a point and ends the path along the approach
+# direction - so the robot stopped honouring the goal arrow's heading. step4
+# uses SmacPlannerLattice (heading is part of the search, footprint-aware) with
+# DWB's ObstacleFootprint critic: no corner hits in testing, and it aligns to
+# the arrow. Pass nav2_params_step1 for the previous 2D-planner setup, or
+# nav2_params for the old baseline.
+# step3 (Hybrid planner) was tried and rejected on 2026-10-08: forward-only
 # curves need room for a U-turn, and 52 planner failures in one session.
-PARAMS_NAME="${2:-nav2_params_step1}"
+PARAMS_NAME="${2:-nav2_params_step4_lattice}"
 PARAMS="/ros2_ws/src/ros-amr/config/${PARAMS_NAME}.yaml"
 MAP_NAME="${1:?usage: start_navigation.sh <map_name> [params_name]}"
 

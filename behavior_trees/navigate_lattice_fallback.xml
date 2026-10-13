@@ -1,0 +1,51 @@
+<!--
+  Nav2 Humble's navigate_to_pose_w_replanning_and_recovery.xml with ONE change:
+  the planning step falls back to a second planner.
+
+  2026-10-12. The Lattice planner ("GridBased", footprint- and heading-aware) is the
+  first choice, but it fails in two situations where the old 2D planner works:
+    - very short moves: its smallest arcs are ~0.5 m, and goals 0.2-0.7 m from the
+      robot all failed with "no valid path found";
+    - "starting point in lethal space": the robot's estimated pose puts its
+      rectangle on a wall (a slightly misaligned pose), so Lattice refuses to plan.
+  The <Fallback> below runs the second ComputePathToPose ("Fallback2D" = SmacPlanner2D,
+  declared in the params file's planner_plugins) only if the first one fails, so normal
+  goals still get the footprint-aware Lattice path. The replan happens at 1 Hz, so the
+  planner in use can change between replans (e.g. the 2D planner takes over for the
+  last few tens of centimetres where Lattice can no longer plan).
+
+  Everything else - the recovery sequence, the FollowPath retry - is the stock tree.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback name="PlanLatticeThen2D">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="Fallback2D"/>
+            </Fallback>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="5"/>
+          <BackUp backup_dist="0.30" backup_speed="0.05"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

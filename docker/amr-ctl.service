@@ -1,0 +1,23 @@
+# Host-side restart helper for the web UI (2026-10-12). Runs OUTSIDE the ROS
+# container and the amr-stack service so it survives the restart it performs.
+# See web_hmi/amr_ctl.py for what it does. Install with docker/install_amr_ctl.sh.
+#
+# Day to day:
+#   systemctl status amr-ctl
+#   journalctl -u amr-ctl -f       # each restart stage is logged here
+#   curl localhost:8081/ctl/status
+
+[Unit]
+Description=AMR restart helper (web UI "Restart everything")
+After=docker.service network.target
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/ros2_ws/src/ros-amr/web_hmi/amr_ctl.py --port 8081
+# Never let a crash of the helper leave the page without a restart button.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
